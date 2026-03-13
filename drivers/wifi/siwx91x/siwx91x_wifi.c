@@ -261,6 +261,7 @@ static int siwx91x_send(const struct device *dev, struct net_pkt *pkt)
 	ret = sl_wifi_send_raw_data_frame(FIELD_GET(SIWX91X_INTERFACE_MASK, interface),
 					  buf->data, pkt_len);
 	if (ret) {
+		LOG_ERR("Couldn't send");
 		net_buf_unref(buf);
 		return -EIO;
 	}
