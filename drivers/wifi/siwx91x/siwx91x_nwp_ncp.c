@@ -228,6 +228,7 @@ sl_status_t sl_si91x_host_init(const sl_si91x_host_init_configuration_t *config)
 		return SL_STATUS_FAIL;
 	}
 
+#if DT_INST_NODE_HAS_PROP(0, sleep_request_gpios)
 	if (!gpio_is_ready_dt(&cfg->sleep_gpio)) {
 		LOG_ERR("Sleep GPIO device not ready");
 		return SL_STATUS_NOT_INITIALIZED;
@@ -237,7 +238,9 @@ sl_status_t sl_si91x_host_init(const sl_si91x_host_init_configuration_t *config)
 		LOG_ERR("Failed to configure Sleep GPIO: %d", ret);
 		return SL_STATUS_FAIL;
 	}
+#endif
 
+#if DT_INST_NODE_HAS_PROP(0, wake_gpios)
 	if (!gpio_is_ready_dt(&cfg->wake_gpio)) {
 		LOG_ERR("Wake GPIO device not ready");
 		return SL_STATUS_NOT_INITIALIZED;
@@ -247,6 +250,7 @@ sl_status_t sl_si91x_host_init(const sl_si91x_host_init_configuration_t *config)
 		LOG_ERR("Failed to configure Wake GPIO: %d", ret);
 		return SL_STATUS_FAIL;
 	}
+#endif
 
 	/* Configure IRQ GPIO as input with interrupt on rising edge */
 	if (!gpio_is_ready_dt(&cfg->irq_gpio)) {
