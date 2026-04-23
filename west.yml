@@ -23,6 +23,8 @@ manifest:
       url-base: https://github.com/zephyrproject-rtos
     - name: babblesim
       url-base: https://github.com/BabbleSim
+    - name: slatesafety
+      url-base: git@github.com:SlateSafety
 
   group-filter: [-babblesim, -optional, -testing]
 
@@ -248,7 +250,12 @@ manifest:
       groups:
         - hal
     - name: hal_silabs
+#<<<<<<< HEAD
       revision: d91d60465ca99b0a8e44a429769ee759843267f7
+#=======
+      #remote: slatesafety
+      #revision: 40219782e0370ebfeca5f4fb223faf2c82d2afff
+#>>>>>>> de36d51ac0b (Point hal_silabs remote to SlateSafety fork)
       path: modules/hal/silabs
       groups:
         - hal
