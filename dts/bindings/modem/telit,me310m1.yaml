@@ -1,0 +1,30 @@
+# Copyright (c) 2026 Slate Safety
+# SPDX-License-Identifier: Apache-2.0
+
+description: Telit ME310M1 Modem
+
+compatible: "telit,me310m1"
+
+include: zephyr,cellular-modem-device.yaml
+
+properties:
+  mdm-power-gpios:
+    type: phandle-array
+    required: true
+    description:
+      GPIO connected to the modem ON_OFF pin. A pulse on this line
+      toggles the modem on or off (active-low, open-drain on this board).
+
+  mdm-reset-gpios:
+    type: phandle-array
+    description:
+      GPIO connected to the modem HW_SHUTDOWN pin.  Asserting this line
+      forces an immediate hardware shutdown.
+
+  mdm-supply-gpios:
+    type: phandle-array
+    description:
+      GPIO that enables the modem's power supply (e.g. a load-switch
+      enable line).  When present the driver asserts this GPIO before
+      any other power-on operations and de-asserts it after the modem
+      has been fully powered off.

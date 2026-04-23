@@ -187,6 +187,7 @@ struct modem_cellular_config {
 	struct gpio_dt_spec power_gpio;
 	struct gpio_dt_spec reset_gpio;
 	struct gpio_dt_spec wake_gpio;
+	struct gpio_dt_spec supply_gpio;
 	uint16_t power_pulse_duration_ms;
 	uint16_t reset_pulse_duration_ms;
 	uint16_t startup_time_ms;
@@ -640,7 +641,7 @@ MODEM_CHAT_MATCHES_DEFINE(dial_abort_matches,
 #if DT_HAS_COMPAT_STATUS_OKAY(swir_hl7800) || DT_HAS_COMPAT_STATUS_OKAY(sqn_gm02s) || \
 	DT_HAS_COMPAT_STATUS_OKAY(quectel_eg800q) || DT_HAS_COMPAT_STATUS_OKAY(quectel_eg25_g) || \
 	DT_HAS_COMPAT_STATUS_OKAY(quectel_bg95) || DT_HAS_COMPAT_STATUS_OKAY(quectel_bg96) || \
-	DT_HAS_COMPAT_STATUS_OKAY(simcom_a76xx)
+	DT_HAS_COMPAT_STATUS_OKAY(simcom_a76xx)|| DT_HAS_COMPAT_STATUS_OKAY(telit_me310m1)
 MODEM_CHAT_MATCH_DEFINE(connect_match, "CONNECT", "", NULL);
 #endif
 
@@ -2207,6 +2208,12 @@ static int modem_cellular_init(const struct device *dev)
 
 	k_sem_init(&data->suspended_sem, 0, 1);
 
+	if (modem_cellular_gpio_is_enabled(&config->supply_gpio)) {
+		gpio_pin_configure_dt(&config->supply_gpio, GPIO_OUTPUT_ACTIVE);
+		gpio_pin_set_dt(&config->supply_gpio, 1);
+		k_msleep(50);
+	}
+
 	if (modem_cellular_gpio_is_enabled(&config->wake_gpio)) {
 		gpio_pin_configure_dt(&config->wake_gpio, GPIO_OUTPUT_INACTIVE);
 	}
@@ -2840,6 +2847,57 @@ MODEM_CHAT_SCRIPT_DEFINE(telit_mex10g1_periodic_chat_script,
 
 #endif
 
+#if DT_HAS_COMPAT_STATUS_OKAY(telit_me310m1)
+MODEM_CHAT_SCRIPT_CMDS_DEFINE(telit_me310m1_init_chat_script_cmds,
+				  MODEM_CHAT_SCRIPT_CMD_RESP_NONE("AT", 100),
+				  MODEM_CHAT_SCRIPT_CMD_RESP_NONE("AT", 100),
+				  MODEM_CHAT_SCRIPT_CMD_RESP_NONE("AT", 100),
+				  MODEM_CHAT_SCRIPT_CMD_RESP_NONE("AT", 100),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("ATE0", ok_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("AT+ICCID", iccid_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("AT+CIMI", cimi_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("AT+CFUN=4", ok_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("AT+COPS=0", ok_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("AT+CMEE=1", ok_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("AT+CREG=1", ok_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG=3", ok_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("AT+CREG?", ok_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG?", ok_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGSN", imei_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGMM", cgmm_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGMI", cgmi_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGMR", cgmr_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("AT+CFUN=1", ok_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP_NONE("AT+CMUX=0,0,5,127",
+								  300));
+
+MODEM_CHAT_SCRIPT_DEFINE(telit_me310m1_init_chat_script, telit_me310m1_init_chat_script_cmds,
+			 abort_matches, modem_cellular_chat_callback_handler, 10);
+
+MODEM_CHAT_SCRIPT_CMDS_DEFINE(telit_me310m1_dial_chat_script_cmds,
+			      MODEM_CHAT_SCRIPT_CMD_RESP("ATE0", ok_match),
+			      MODEM_CHAT_SCRIPT_CMD_RESP("ATD*99***1#", connect_match)
+				);
+
+MODEM_CHAT_SCRIPT_DEFINE(telit_me310m1_dial_chat_script, telit_me310m1_dial_chat_script_cmds,
+			 dial_abort_matches, modem_cellular_chat_callback_handler, 10);
+
+MODEM_CHAT_SCRIPT_CMDS_DEFINE(telit_me310m1_periodic_chat_script_cmds,
+			      MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG?", ok_match)
+				);
+
+MODEM_CHAT_SCRIPT_DEFINE(telit_me310m1_periodic_chat_script,
+			 telit_me310m1_periodic_chat_script_cmds, abort_matches,
+			 modem_cellular_chat_callback_handler, 4);
+
+#endif
+
 #if DT_HAS_COMPAT_STATUS_OKAY(telit_me310g1)
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(telit_me310g1_shutdown_chat_script_cmds,
 			      MODEM_CHAT_SCRIPT_CMD_RESP("AT#SHDN", ok_match));
@@ -2983,6 +3041,7 @@ MODEM_CHAT_SCRIPT_DEFINE(sqn_gm02s_periodic_chat_script,
 		.power_gpio = GPIO_DT_SPEC_INST_GET_OR(inst, mdm_power_gpios, {}),                 \
 		.reset_gpio = GPIO_DT_SPEC_INST_GET_OR(inst, mdm_reset_gpios, {}),                 \
 		.wake_gpio = GPIO_DT_SPEC_INST_GET_OR(inst, mdm_wake_gpios, {}),                   \
+		.supply_gpio = GPIO_DT_SPEC_INST_GET_OR(inst, mdm_supply_gpios, {}),                   \
 		.power_pulse_duration_ms = (power_ms),                                             \
 		.reset_pulse_duration_ms = (reset_ms),                                             \
 		.startup_time_ms  = (startup_ms),                                                  \
@@ -3216,6 +3275,25 @@ MODEM_CHAT_SCRIPT_DEFINE(sqn_gm02s_periodic_chat_script,
 				       &telit_mex10g1_periodic_chat_script,                        \
 				       &telit_me310g1_shutdown_chat_script)
 
+#define MODEM_CELLULAR_DEVICE_TELIT_ME310M1(inst)                                                  \
+	MODEM_DT_INST_PPP_DEFINE(inst, MODEM_CELLULAR_INST_NAME(ppp, inst), NULL, 98, 1500, 64);   \
+                                                                                                   \
+	static struct modem_cellular_data MODEM_CELLULAR_INST_NAME(data, inst) = {                 \
+		.chat_delimiter = "\r",                                                            \
+		.chat_filter = "\n",                                                               \
+		.ppp = &MODEM_CELLULAR_INST_NAME(ppp, inst),                                       \
+	};                                                                                         \
+                                                                                                   \
+	MODEM_CELLULAR_DEFINE_AND_INIT_USER_PIPES(inst,                                            \
+						  (user_pipe_0, 3))                                \
+                                                                                                   \
+	MODEM_CELLULAR_DEFINE_INSTANCE(inst, 5050, 0 /* unused */, 1000, 15000, false,             \
+				       NULL,                                                       \
+				       &telit_me310m1_init_chat_script,                            \
+				       &telit_me310m1_dial_chat_script,                            \
+				       &telit_me310m1_periodic_chat_script,                        \
+				       NULL)
+
 #define MODEM_CELLULAR_DEVICE_NORDIC_NRF91_SLM(inst)						   \
 	MODEM_DT_INST_PPP_DEFINE(inst, MODEM_CELLULAR_INST_NAME(ppp, inst), NULL, 98, 1500, 1500); \
                                                                                                    \
@@ -3299,6 +3377,10 @@ DT_INST_FOREACH_STATUS_OKAY(MODEM_CELLULAR_DEVICE_TELIT_ME910G1)
 
 #define DT_DRV_COMPAT telit_me310g1
 DT_INST_FOREACH_STATUS_OKAY(MODEM_CELLULAR_DEVICE_TELIT_ME310G1)
+#undef DT_DRV_COMPAT
+
+#define DT_DRV_COMPAT telit_me310m1
+DT_INST_FOREACH_STATUS_OKAY(MODEM_CELLULAR_DEVICE_TELIT_ME310M1)
 #undef DT_DRV_COMPAT
 
 #define DT_DRV_COMPAT nordic_nrf91_slm
