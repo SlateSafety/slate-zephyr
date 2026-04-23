@@ -58,6 +58,10 @@ struct siwx91x_ncp_config {
 #endif
 };
 
+static const struct device *gpiog_dev = DEVICE_DT_GET(DT_NODELABEL(gpiog));
+static const struct device *gpioa_dev = DEVICE_DT_GET(DT_NODELABEL(gpioa));
+#define LOAD_SW_PIN 11
+
 struct siwx91x_ncp_data {
 	char current_country_code[WIFI_COUNTRY_CODE_LEN];
 	sl_si91x_host_rx_irq_handler rx_irq_handler;
@@ -180,6 +184,7 @@ static void siwx91x_ncp_irq_callback(const struct device *port, struct gpio_call
 	}
 
 	struct siwx91x_ncp_data *data = ncp_dev_instance->data;
+	// LOG_INF("irq cb %d %p", data->bus_irq_enabled, data->rx_irq_handler);
 
 	if (data->bus_irq_enabled && data->rx_irq_handler != NULL) {
 		data->rx_irq_handler();
@@ -251,6 +256,13 @@ sl_status_t sl_si91x_host_init(const sl_si91x_host_init_configuration_t *config)
 		return SL_STATUS_FAIL;
 	}
 #endif
+	gpio_pin_configure(gpiog_dev, LOAD_SW_PIN,
+                       GPIO_OUTPUT | GPIO_ACTIVE_HIGH);
+	gpio_pin_set(gpiog_dev, LOAD_SW_PIN, 1);
+	k_msleep(100);
+
+	gpio_pin_configure(gpioa_dev, 15,
+                       GPIO_OUTPUT | GPIO_ACTIVE_LOW | GPIO_PULL_UP);
 
 	/* Configure IRQ GPIO as input with interrupt on rising edge */
 	if (!gpio_is_ready_dt(&cfg->irq_gpio)) {
@@ -303,7 +315,8 @@ sl_status_t sl_si91x_host_deinit(void)
 }
 
 /* === SPI Transfer === */
-
+#define SLI_SPI_BUFFER_LENGTH 2300
+uint8_t sli_spi_buffer[SLI_SPI_BUFFER_LENGTH];
 sl_status_t sl_si91x_host_spi_transfer(const void *tx_buffer, void *rx_buffer,
 				       uint16_t buffer_length)
 {
@@ -313,8 +326,16 @@ sl_status_t sl_si91x_host_spi_transfer(const void *tx_buffer, void *rx_buffer,
 
 	struct siwx91x_ncp_data *data = ncp_dev_instance->data;
 	const struct siwx91x_ncp_config *cfg = ncp_dev_instance->config;
-	int ret;
+	int ret = 0;
 
+	if (tx_buffer == NULL) {
+		tx_buffer = sli_spi_buffer;
+	}
+
+	if (rx_buffer == NULL) {
+		rx_buffer = sli_spi_buffer;
+	}
+	
 	struct spi_buf tx_buf = {
 		.buf = (void *)tx_buffer,
 		.len = buffer_length,
@@ -332,18 +353,7 @@ sl_status_t sl_si91x_host_spi_transfer(const void *tx_buffer, void *rx_buffer,
 		.buffers = &rx_buf,
 		.count = 1,
 	};
-
-	/*
-	 * CS is managed by the WiseConnect NCP protocol layer via
-	 * sl_si91x_host_spi_cs_assert/deassert — not here.
-	 */
-	if (tx_buffer != NULL && rx_buffer != NULL) {
-		ret = spi_transceive(cfg->spi.bus, &data->spi_cfg, &tx_set, &rx_set);
-	} else if (tx_buffer != NULL) {
-		ret = spi_write(cfg->spi.bus, &data->spi_cfg, &tx_set);
-	} else {
-		ret = spi_read(cfg->spi.bus, &data->spi_cfg, &rx_set);
-	}
+	ret = spi_transceive(cfg->spi.bus, &data->spi_cfg, &tx_set, &rx_set);
 
 	if (ret < 0) {
 		LOG_ERR("SPI transfer failed: %d (len=%u)", ret, buffer_length);
@@ -363,7 +373,8 @@ void sl_si91x_host_spi_cs_assert(void)
 	const struct siwx91x_ncp_config *cfg = ncp_dev_instance->config;
 
 	/* CS is on the SPI bus cs-gpios — assert via GPIO for manual control */
-	gpio_pin_set_dt(&cfg->cs_gpio, 1);
+	// gpio_pin_set_dt(&cfg->cs_gpio, 1);
+	gpio_pin_set(gpioa_dev, 15, 1);
 }
 
 void sl_si91x_host_spi_cs_deassert(void)
@@ -373,7 +384,8 @@ void sl_si91x_host_spi_cs_deassert(void)
 	}
 	const struct siwx91x_ncp_config *cfg = ncp_dev_instance->config;
 
-	gpio_pin_set_dt(&cfg->cs_gpio, 0);
+	// gpio_pin_set_dt(&cfg->cs_gpio, 0);
+	gpio_pin_set(gpioa_dev, 15, 0);
 }
 
 /* === Reset Control === */
@@ -512,7 +524,7 @@ bool sl_si91x_host_is_in_irq_context(void)
 /* ========================================================================== */
 
 #define AP_MAX_NUM_STA 4
-
+#define MEMORY_CONFIG (BIT(20) | BIT(21))
 static void siwx91x_ncp_configure_sta_mode(sl_si91x_boot_configuration_t *boot_config)
 {
 	const bool wifi_enabled = IS_ENABLED(CONFIG_WIFI_SILABS_SIWX91X);
@@ -522,7 +534,8 @@ static void siwx91x_ncp_configure_sta_mode(sl_si91x_boot_configuration_t *boot_c
 
 	if (IS_ENABLED(CONFIG_WIFI_SILABS_SIWX91X_ROAMING_USE_DEAUTH)) {
 		boot_config->custom_feature_bit_map |=
-			SL_SI91X_CUSTOM_FEAT_ROAM_WITH_DEAUTH_OR_NULL_DATA;
+			SL_SI91X_CUSTOM_FEAT_ROAM_WITH_DEAUTH_OR_NULL_DATA | 
+			SL_SI91X_CUSTOM_FEAT_WAKE_ON_WIRELESS | SL_SI91X_CUSTOM_FEAT_EXTENTION_VALID;
 	}
 
 	if (wifi_enabled && bt_enabled) {
@@ -531,7 +544,7 @@ static void siwx91x_ncp_configure_sta_mode(sl_si91x_boot_configuration_t *boot_c
 	} else if (wifi_enabled) {
 		boot_config->coex_mode = SL_SI91X_WLAN_ONLY_MODE;
 	} else if (bt_enabled) {
-		boot_config->coex_mode = SL_SI91X_BLE_MODE;
+		boot_config->coex_mode = SL_SI91X_WLAN_BLE_MODE;
 	} else {
 		boot_config->coex_mode = SL_SI91X_WLAN_ONLY_MODE;
 	}
@@ -541,41 +554,31 @@ static void siwx91x_ncp_configure_sta_mode(sl_si91x_boot_configuration_t *boot_c
 	boot_config->ext_custom_feature_bit_map |= SL_SI91X_EXT_FEAT_IEEE_80211W | SL_SI91X_EXT_FEAT_FRONT_END_SWITCH_PINS_ULP_GPIO_4_5_0;
 
 	if (IS_ENABLED(CONFIG_WIFI_SILABS_SIWX91X_ENHANCED_MAX_PSP)) {
-		boot_config->config_feature_bit_map |= SL_SI91X_CONFIG_FEAT_EXTENSION_VALID
+		boot_config->config_feature_bit_map = SL_SI91X_FEAT_SLEEP_GPIO_SEL_BITMAP | SL_SI91X_ULP_GPIO9_FOR_UART2_TX
 						     | SL_SI91X_ENABLE_ENHANCED_MAX_PSP;
 	}
 #endif
-
+	
 #ifdef CONFIG_BT_SILABS_SIWX91X
-	/* BLE feature bitmaps for NCP + Zephyr HCI host (stack bypass mode).
-	 *
-	 * SL_SI91X_BT_BLE_STACK_BYPASS_ENABLE (ble_ext_feature_bit_map bit 24):
-	 *   REQUIRED — tells the NWP to bypass its internal BLE stack and pass
-	 *   raw HCI frames to/from the host MCU via rsi_bt_driver_send_cmd /
-	 *   RSI_BLE_ON_RCP_EVENT.  This is what allows Zephyr's BT host to drive
-	 *   the SiWx917 controller directly over SPI.
-	 *
-	 * ATT record / service counts (ble_feature_bit_map bits 0–11):
-	 *   Must be non-zero even in bypass mode — the NWP still allocates GATT
-	 *   table memory from these values before handing control to the host.
-	 *   Zero values cause silent GATT failures or error 0x10063.
-	 */
+	// boot_config->feature_bit_map |=  SL_SI91X_FEAT_DEV_TO_HOST_ULP_GPIO_1;
 	boot_config->ext_custom_feature_bit_map |= SL_SI91X_EXT_FEAT_BT_CUSTOM_FEAT_ENABLE;
 	boot_config->bt_feature_bit_map |= SL_SI91X_BT_RF_TYPE | SL_SI91X_ENABLE_BLE_PROTOCOL;
 	boot_config->ble_feature_bit_map |=
-		SL_SI91X_BLE_MAX_NBR_PERIPHERALS(RSI_BLE_MAX_NBR_PERIPHERALS) |
-		SL_SI91X_BLE_MAX_NBR_CENTRALS(RSI_BLE_MAX_NBR_CENTRALS) |
-		SL_SI91X_BLE_MAX_NBR_ATT_SERV(RSI_BLE_MAX_NBR_ATT_SERV) |
-		SL_SI91X_BLE_MAX_NBR_ATT_REC(RSI_BLE_MAX_NBR_ATT_REC) |
-		SL_SI91X_BLE_PWR_INX(RSI_BLE_PWR_INX) |
+		SL_SI91X_BLE_MAX_NBR_PERIPHERALS(3) |
+		SL_SI91X_BLE_MAX_NBR_CENTRALS(1) |
+		SL_SI91X_BLE_MAX_NBR_ATT_SERV(10) |
+		SL_SI91X_BLE_MAX_NBR_ATT_REC(80) |
+		SL_SI91X_BLE_PWR_INX(63) |
+		SL_SI91X_BLE_PWR_SAVE_OPTIONS(0) |
 		SL_SI91X_916_BLE_COMPATIBLE_FEAT_ENABLE |
-		SL_SI91X_FEAT_BLE_CUSTOM_FEAT_EXTENSION_VALID;
+		SL_SI91X_FEAT_BLE_CUSTOM_FEAT_EXTENTION_VALID;
 
 	boot_config->ble_ext_feature_bit_map |=
-		SL_SI91X_BLE_NUM_CONN_EVENTS(RSI_BLE_NUM_CONN_EVENTS) |
-		SL_SI91X_BLE_NUM_REC_BYTES(RSI_BLE_NUM_REC_BYTES) | SL_SI91X_BLE_ENABLE_ADV_EXTN |
-		SL_SI91X_BLE_AE_MAX_ADV_SETS(RSI_BLE_AE_MAX_ADV_SETS) |
-		SL_SI91X_BT_BLE_STACK_BYPASS_ENABLE;
+		SL_SI91X_BLE_NUM_CONN_EVENTS(20) |
+		SL_SI91X_BLE_NUM_REC_BYTES(0x40) | SL_SI91X_BLE_ENABLE_ADV_EXTN |
+		SL_SI91X_BLE_GATT_INIT |
+		BIT(23) |
+		SL_SI91X_BLE_AE_MAX_ADV_SETS(2);
 #endif
 }
 
@@ -645,42 +648,15 @@ static int siwx91x_ncp_get_config(const struct device *dev,
 		.mac_address = NULL,
 		.band        = SL_WIFI_BAND_MODE_2_4GHZ,
 		.region_code = SL_WIFI_IGNORE_REGION,
-		// .boot_config = {
-		// 	.oper_mode              = SL_SI91X_CLIENT_MODE,
-		// 	.coex_mode              = SL_SI91X_WLAN_ONLY_MODE,
-		// 	.feature_bit_map        = (SL_SI91X_FEAT_SECURITY_OPEN | SL_SI91X_FEAT_SECURITY_PSK
-		// 				 | SL_SI91X_FEAT_AGGREGATION | SL_SI91X_FEAT_ULP_GPIO_BASED_HANDSHAKE | SL_SI91X_FEAT_DEV_TO_HOST_ULP_GPIO_1),
-		// 	.tcp_ip_feature_bit_map = SL_SI91X_TCP_IP_FEAT_BYPASS,
-		// 	.custom_feature_bit_map = SL_SI91X_CUSTOM_FEAT_EXTENSION_VALID,
-		// 	.ext_custom_feature_bit_map =
-		// 		(SL_SI91X_EXT_FEAT_XTAL_CLK
-		// 		| SL_SI91X_EXT_FEAT_UART_SEL_FOR_DEBUG_PRINTS
-		// 		| SL_SI91X_EXT_FEAT_672K_M4SS_0K
-		// 		| SL_SI91X_EXT_FEAT_FRONT_END_SWITCH_PINS_ULP_GPIO_4_5_0),
-		// 	.bt_feature_bit_map         = 0,
-		// 	.ext_tcp_ip_feature_bit_map = 0,
-		// 	.ble_feature_bit_map        = 0,
-		// 	.ble_ext_feature_bit_map    = 0,
-		// 	.config_feature_bit_map     = SL_SI91X_FEAT_SLEEP_GPIO_SEL_BITMAP,
-		// }
 		.boot_config = {
 			.oper_mode              = SL_SI91X_CLIENT_MODE,
 			.feature_bit_map = SL_SI91X_FEAT_SECURITY_OPEN | SL_SI91X_FEAT_WPS_DISABLE |
 					   SL_SI91X_FEAT_SECURITY_PSK | SL_SI91X_FEAT_AGGREGATION |
 					   SL_SI91X_FEAT_HIDE_PSK_CREDENTIALS,
 			.tcp_ip_feature_bit_map = SL_SI91X_TCP_IP_FEAT_EXTENSION_VALID,
-			.custom_feature_bit_map = SL_SI91X_CUSTOM_FEAT_EXTENSION_VALID |
-						  SL_SI91X_CUSTOM_FEAT_ASYNC_CONNECTION_STATUS |
-						  SL_SI91X_CUSTOM_FEAT_RTC_FROM_HOST,
+			.custom_feature_bit_map = SL_SI91X_CUSTOM_FEAT_EXTENSION_VALID,
 			.ext_custom_feature_bit_map =
-				SL_SI91X_EXT_FEAT_XTAL_CLK | SL_SI91X_EXT_FEAT_1P8V_SUPPORT |
-				SL_SI91X_EXT_FEAT_DISABLE_XTAL_CORRECTION |
-				SL_SI91X_EXT_FEAT_UART_SEL_FOR_DEBUG_PRINTS |
-				SL_SI91X_EXT_FEAT_NWP_QSPI_80MHZ_CLK_ENABLE |
-				SL_SI91X_EXT_FEAT_672K_M4SS_0K |
-				SL_SI91X_EXT_FEAT_FRONT_END_SWITCH_PINS_ULP_GPIO_4_5_0 |
-				SL_SI91X_EXT_FEAT_FRONT_END_INTERNAL_SWITCH |
-				SL_SI91X_EXT_FEAT_XTAL_CLK,
+				MEMORY_CONFIG,
 		}
 	};
 
@@ -822,18 +798,23 @@ static int siwx91x_nwp_ncp_init(const struct device *dev)
 		return -EINVAL;
 	}
 
-	sl_wifi_performance_profile_t wifi_profile = { .profile = SL_WIFI_SYSTEM_HIGH_PERFORMANCE };
-    ret = sl_wifi_set_performance_profile(&wifi_profile);
-    if (ret != SL_STATUS_OK) {
-        LOG_ERR("Failed to set WiFi High Performance mode: 0x%x", ret);
-    }
+	/* Use HIGH_PERFORMANCE until sleep/wake GPIO handshaking is implemented.
+	 * ASSOCIATED_POWER_SAVE requires the sleep-request and wake-indicator GPIOs
+	 * to be functional — without them the NWP may sleep and never wake for SPI
+	 * transactions, causing command timeouts (especially BLE).
+	 */
+	sl_wifi_performance_profile_v2_t wifi_profile = { .profile = HIGH_PERFORMANCE };
+	ret = sl_wifi_set_performance_profile_v2(&wifi_profile);
+	if (ret != SL_STATUS_OK) {
+		LOG_ERR("Failed to set WiFi performance profile: 0x%x", ret);
+	}
 
 #ifdef CONFIG_BT_SILABS_SIWX91X
-    sl_bt_performance_profile_t bt_profile = { .profile = SL_WIFI_SYSTEM_HIGH_PERFORMANCE };
-    // ret = sl_si91x_bt_set_performance_profile(&bt_profile);
-    if (ret != SL_STATUS_OK) {
-        LOG_ERR("Failed to set BT High Performance mode: 0x%x", ret);
-    }
+	sl_bt_performance_profile_t bt_profile = { .profile = HIGH_PERFORMANCE };
+	ret = sl_si91x_bt_set_performance_profile(&bt_profile);
+	if (ret != SL_STATUS_OK) {
+		LOG_ERR("Failed to set BT performance profile: 0x%x", ret);
+	}
 #endif
 
 	/* Check firmware version */
