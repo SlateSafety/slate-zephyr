@@ -1411,7 +1411,7 @@ static int modem_cellular_on_run_apn_script_state_enter(struct modem_cellular_da
 {
 	/* Allow modem time to enter command mode before running apn script */
 	modem_cellular_start_timer(data, K_MSEC(200));
-	modem_cellular_build_apn_script(data);
+	// modem_cellular_build_apn_script(data);
 	return 0;
 }
 
@@ -1420,8 +1420,9 @@ static void modem_cellular_run_apn_script_event_handler(struct modem_cellular_da
 {
 	switch (evt) {
 	case MODEM_CELLULAR_EVENT_TIMEOUT:
-		modem_chat_attach(&data->chat, data->dlci1_pipe);
-		modem_chat_run_script_async(&data->chat, &data->apn_script);
+		// modem_chat_attach(&data->chat, data->dlci1_pipe);
+		// modem_chat_run_script_async(&data->chat, &data->apn_script);
+		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_RUN_DIAL_SCRIPT);
 		break;
 	case MODEM_CELLULAR_EVENT_SCRIPT_SUCCESS:
 		modem_cellular_script_success(data);
@@ -3251,11 +3252,14 @@ MODEM_CHAT_SCRIPT_DEFINE(telit_mex10g1_periodic_chat_script,
 
 #if DT_HAS_COMPAT_STATUS_OKAY(telit_me310m1)
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(telit_me310m1_init_chat_script_cmds,
-				  MODEM_CHAT_SCRIPT_CMD_RESP_NONE("AT", 100),
-				  MODEM_CHAT_SCRIPT_CMD_RESP_NONE("AT", 100),
-				  MODEM_CHAT_SCRIPT_CMD_RESP_NONE("AT", 100),
-				  MODEM_CHAT_SCRIPT_CMD_RESP_NONE("AT", 100),
+				  MODEM_CHAT_SCRIPT_CMD_RESP_NONE("AT", 1000),
+				  MODEM_CHAT_SCRIPT_CMD_RESP_NONE("AT", 1000),
+				  MODEM_CHAT_SCRIPT_CMD_RESP_NONE("AT", 1000),
+				  MODEM_CHAT_SCRIPT_CMD_RESP_NONE("AT", 1000),
+				  MODEM_CHAT_SCRIPT_CMD_RESP_NONE("AT", 1000),
 				  MODEM_CHAT_SCRIPT_CMD_RESP("ATE0", ok_match),
+				//   MODEM_CHAT_SCRIPT_CMD_RESP("AT+IPR=115200", ok_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP("AT&K3", ok_match),
 				  MODEM_CHAT_SCRIPT_CMD_RESP("AT+ICCID", iccid_match),
 				  MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
 				  MODEM_CHAT_SCRIPT_CMD_RESP("AT+CIMI", cimi_match),
@@ -3276,14 +3280,18 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(telit_me310m1_init_chat_script_cmds,
 				  MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGMR", cgmr_match),
 				  MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
 				  MODEM_CHAT_SCRIPT_CMD_RESP("AT+CFUN=1", ok_match),
-				  MODEM_CHAT_SCRIPT_CMD_RESP_NONE("AT+CMUX=0,0,5,127",
-								  300));
+				//   MODEM_CHAT_SCRIPT_CMD_RESP("AT+CMUX=?", ok_match),
+				//   MODEM_CHAT_SCRIPT_CMD_RESP("AT+CMUX?", ok_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP_NONE("AT+CMUX=0,0,5,127", 300)
+								);
 
 MODEM_CHAT_SCRIPT_DEFINE(telit_me310m1_init_chat_script, telit_me310m1_init_chat_script_cmds,
 			 abort_matches, modem_cellular_chat_callback_handler, 10);
 
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(telit_me310m1_dial_chat_script_cmds,
-			      MODEM_CHAT_SCRIPT_CMD_RESP("ATE0", ok_match),
+				  MODEM_CHAT_SCRIPT_CMD_RESP_NONE("+++", 300),
+				//   MODEM_CHAT_SCRIPT_CMD_RESP("ATH", allow_match),
+			    //   MODEM_CHAT_SCRIPT_CMD_RESP("ATE0", ok_match),
 			      MODEM_CHAT_SCRIPT_CMD_RESP("ATD*99***1#", connect_match)
 				);
 
@@ -3291,7 +3299,8 @@ MODEM_CHAT_SCRIPT_DEFINE(telit_me310m1_dial_chat_script, telit_me310m1_dial_chat
 			 dial_abort_matches, modem_cellular_chat_callback_handler, 10);
 
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(telit_me310m1_periodic_chat_script_cmds,
-			      MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG?", ok_match)
+			      MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG?", ok_match),
+				//   MODEM_CHAT_SCRIPT_CMD_RESP("AT+CSQ?", ok_match),
 				);
 
 MODEM_CHAT_SCRIPT_DEFINE(telit_me310m1_periodic_chat_script,
@@ -3689,7 +3698,7 @@ MODEM_CHAT_SCRIPT_DEFINE(sqn_gm02s_periodic_chat_script,
 	MODEM_CELLULAR_DEFINE_AND_INIT_USER_PIPES(inst,                                            \
 						  (user_pipe_0, 3))                                \
                                                                                                    \
-	MODEM_CELLULAR_DEFINE_INSTANCE(inst, 5050, 0 /* unused */, 1000, 15000, false,             \
+	MODEM_CELLULAR_DEFINE_INSTANCE(inst, 1000, 500, 5000, 15000, true,             \
 				       NULL,                                                       \
 				       &telit_me310m1_init_chat_script,                            \
 				       &telit_me310m1_dial_chat_script,                            \
