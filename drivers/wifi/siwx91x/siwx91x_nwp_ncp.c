@@ -35,6 +35,7 @@
 
 #ifdef CONFIG_BT_SILABS_SIWX91X
 #include "rsi_ble_common_config.h"
+#include "sl_si91x_ble.h"
 #endif
 
 LOG_MODULE_REGISTER(siwx91x_nwp_ncp, 4);
@@ -87,15 +88,15 @@ typedef struct {
 	const char *const *codes;
 	size_t num_codes;
 	sl_wifi_region_code_t region_code;
-	const sli_si91x_set_region_ap_request_t *sdk_reg;
+	const sli_wifi_set_region_ap_request_t *sdk_reg;
 } region_map_t;
 
-extern const sli_si91x_set_region_ap_request_t default_US_region_2_4GHZ_configurations;
-extern const sli_si91x_set_region_ap_request_t default_EU_region_2_4GHZ_configurations;
-extern const sli_si91x_set_region_ap_request_t default_JP_region_2_4GHZ_configurations;
-extern const sli_si91x_set_region_ap_request_t default_KR_region_2_4GHZ_configurations;
-extern const sli_si91x_set_region_ap_request_t default_SG_region_2_4GHZ_configurations;
-extern const sli_si91x_set_region_ap_request_t default_CN_region_2_4GHZ_configurations;
+extern const sli_wifi_set_region_ap_request_t default_US_region_2_4GHZ_configurations;
+extern const sli_wifi_set_region_ap_request_t default_EU_region_2_4GHZ_configurations;
+extern const sli_wifi_set_region_ap_request_t default_JP_region_2_4GHZ_configurations;
+extern const sli_wifi_set_region_ap_request_t default_KR_region_2_4GHZ_configurations;
+extern const sli_wifi_set_region_ap_request_t default_SG_region_2_4GHZ_configurations;
+extern const sli_wifi_set_region_ap_request_t default_CN_region_2_4GHZ_configurations;
 
 static const char *const us_codes[] = {
 	"AE", "AR", "AS", "BB", "BM", "BR", "BS", "CA", "CO", "CR", "CU", "CX", "DM", "DO",
@@ -158,7 +159,7 @@ sl_wifi_region_code_t siwx91x_map_country_code_to_region(const char *country_cod
 	return SL_WIFI_DEFAULT_REGION;
 }
 
-const sli_si91x_set_region_ap_request_t *siwx91x_find_sdk_region_table(uint8_t region_code)
+const sli_wifi_set_region_ap_request_t *siwx91x_find_sdk_region_table(uint8_t region_code)
 {
 	ARRAY_FOR_EACH(region_maps, i) {
 		if (region_maps[i].region_code == region_code) {
@@ -696,39 +697,75 @@ static int siwx91x_ncp_get_config(const struct device *dev,
 
 static int siwx91x_ncp_check_fw_version(void)
 {
-	sl_wifi_firmware_version_t expected_version;
 	sl_wifi_firmware_version_t version;
 	int ret;
 
 	ret = sl_wifi_get_firmware_version(&version);
 	if (ret != SL_STATUS_OK) {
+		LOG_ERR("Failed to read NWP firmware version: 0x%x", ret);
 		return -EINVAL;
 	}
 
-	sscanf(SIWX91X_NWP_FW_EXPECTED_VERSION, "%hhX.%hhd.%hhd.%hhd.%hhd.%hhd.%hd",
-	       &expected_version.rom_id,
-	       &expected_version.major,
-	       &expected_version.minor,
-	       &expected_version.security_version,
-	       &expected_version.patch_num,
-	       &expected_version.customer_id,
-	       &expected_version.build_num);
+	LOG_WRN("NWP firmware %x%x.%u.%u.%u.%u.%u.%u (expected %X.%u.%u.%u.%u.%u.%u)",
+		version.chip_id, version.rom_id, version.major, version.minor,
+		version.security_version, version.patch_num, version.customer_id,
+		version.build_num,
+		siwx91x_nwp_fw_expected_version.rom_id,
+		siwx91x_nwp_fw_expected_version.major,
+		siwx91x_nwp_fw_expected_version.minor,
+		siwx91x_nwp_fw_expected_version.security_version,
+		siwx91x_nwp_fw_expected_version.patch_num,
+		siwx91x_nwp_fw_expected_version.customer_id,
+		siwx91x_nwp_fw_expected_version.build_num);
 
-	if (expected_version.major != version.major ||
-	    expected_version.minor != version.minor ||
-	    expected_version.security_version != version.security_version ||
-	    expected_version.patch_num != version.patch_num) {
+	if (siwx91x_nwp_fw_expected_version.major != version.major ||
+	    siwx91x_nwp_fw_expected_version.minor != version.minor ||
+	    siwx91x_nwp_fw_expected_version.security_version != version.security_version ||
+	    siwx91x_nwp_fw_expected_version.patch_num != version.patch_num) {
 		return -EINVAL;
 	}
 
-	if (expected_version.customer_id != version.customer_id) {
+	if (siwx91x_nwp_fw_expected_version.customer_id != version.customer_id) {
 		LOG_DBG("customer_id diverge: expected %d, actual %d",
-			expected_version.customer_id, version.customer_id);
+			siwx91x_nwp_fw_expected_version.customer_id, version.customer_id);
 	}
-	if (expected_version.build_num != version.build_num) {
+	if (siwx91x_nwp_fw_expected_version.build_num != version.build_num) {
 		LOG_DBG("build_num diverge: expected %d, actual %d",
-			expected_version.build_num, version.build_num);
+			siwx91x_nwp_fw_expected_version.build_num, version.build_num);
 	}
+
+	return 0;
+}
+
+int siwx91x_nwp_apply_power_profile(const struct device *dev,
+				    const sl_wifi_performance_profile_v2_t *wifi_profile)
+{
+	sl_wifi_performance_profile_v2_t profile = {
+		.profile = HIGH_PERFORMANCE,
+	};
+	int ret;
+
+	ARG_UNUSED(dev);
+
+	if (wifi_profile != NULL) {
+		profile = *wifi_profile;
+	}
+
+	ret = sl_wifi_set_performance_profile_v2(&profile);
+	if (ret != SL_STATUS_OK) {
+		return -EINVAL;
+ 	}
+ 
+#ifdef CONFIG_BT_SILABS_SIWX91X
+	{
+		sl_bt_performance_profile_t bt_profile = { .profile = profile.profile };
+
+		ret = sl_si91x_bt_set_performance_profile(&bt_profile);
+		if (ret != SL_STATUS_OK) {
+			return -EINVAL;
+		}
+	}
+#endif
 
 	return 0;
 }
@@ -820,8 +857,8 @@ static int siwx91x_nwp_ncp_init(const struct device *dev)
 	/* Check firmware version */
 	ret = siwx91x_ncp_check_fw_version();
 	if (ret < 0) {
-		LOG_ERR("Unexpected NWP firmware version (expected: %s)",
-			SIWX91X_NWP_FW_EXPECTED_VERSION);
+		//LOG_ERR("Unexpected NWP firmware version (expected: %s)",
+			//SIWX91X_NWP_FW_EXPECTED_VERSION);
 		/* Continue — version mismatch is a warning, not fatal */
 	}
 

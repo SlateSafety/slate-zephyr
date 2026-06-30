@@ -247,4 +247,13 @@ config SIWX91X_NCP_RESET_DELAY_MS
 	  Time to wait after releasing reset before attempting SPI
 	  communication. The module bootloader needs time to initialize.
 
+config BT_SILABS_SIWX91X_NCP_BLE_ONLY_COEX
+	bool "Use BLE-only coexistence on NCP (HCI bring-up)"
+	depends on BT_SILABS_SIWX91X
+	default n
+	help
+	  Force SL_SI91X_BLE_MODE even when WiFi is also enabled.
+	  WiFi will not work in this mode; use only to validate BLE HCI
+	  on the NCP SPI interface.
+
 endif # WIFI_SILABS_SIWX91X_NCP_SPI

@@ -5,6 +5,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/bluetooth.h>
+#include <zephyr/sys/byteorder.h>
 
 #define DT_DRV_COMPAT silabs_siwx91x_bt_hci
 #define LOG_LEVEL     CONFIG_BT_HCI_DRIVER_LOG_LEVEL
@@ -13,7 +14,16 @@ LOG_MODULE_REGISTER(bt_hci_driver_siwg917, 4);
 
 #include "rsi_ble.h"
 #include "rsi_ble_common_config.h"
+#if !defined(CONFIG_WIFI_SILABS_SIWX91X_NCP_SPI)
 #include "siwx91x_nwp.h"
+#else
+#include "sli_wifi_event_handler.h"
+#include "sl_si91x_constants.h"
+#include "sl_si91x_driver.h"
+#include "sl_rsi_utility.h"
+
+extern void sli_si91x_process_ble_events(void);
+#endif
 
 #define BLE_RF_POWER_INDEX     0x0006
 #define BT_OP_VS_RF_POWER_MODE BT_OP(BT_OGF_VS, BLE_RF_POWER_INDEX)
@@ -35,17 +45,12 @@ struct hci_data {
 	rsi_data_packet_t rsi_data_packet;
 };
 
-/**
- * @brief Send RF power mode configuration command to controller
- * @param dev Pointer to the device structure
- * @return 0 on success, negative errno on failure
- */
 static int rsi_bt_driver_send_tx_pwr_vs_cmd(const struct device *dev, uint8_t protocol_mode,
 					    uint8_t le_tx_power_index)
 {
 	struct net_buf *buf;
 	int err;
-	/* Allocate HCI command buffer with timeout */
+
 	buf = bt_hci_cmd_alloc(K_FOREVER);
 	if (!buf) {
 		LOG_ERR("Failed to allocate HCI command buffer");
@@ -76,11 +81,20 @@ static int siwx91x_bt_open(const struct device *dev)
 	return status ? -EIO : 0;
 }
 
-static int siwx91x_bt_setup(const struct device *dev, const struct bt_hci_setup_params *params)
+static int siwx91x_bt_setup(const struct device *dev,
+			    const struct bt_hci_setup_params *params)
 {
-	const struct hci_config *hci_config = dev->config;
-	int err = rsi_bt_driver_send_tx_pwr_vs_cmd(dev, BT_LE_MODE, RSI_BLE_PWR_INX);
+	ARG_UNUSED(params);
 
+#if defined(CONFIG_WIFI_SILABS_SIWX91X_NCP_SPI)
+	ARG_UNUSED(dev);
+
+	return 0;
+#else
+	const struct hci_config *hci_config = dev->config;
+	int err;
+
+	err = rsi_bt_driver_send_tx_pwr_vs_cmd(dev, BT_LE_MODE, RSI_BLE_PWR_INX);
 	if (err < 0) {
 		LOG_ERR("Failed to send RF power config command: %d", err);
 		return err;
@@ -93,6 +107,7 @@ static int siwx91x_bt_setup(const struct device *dev, const struct bt_hci_setup_
 	}
 
 	return 0;
+#endif
 }
 
 static int siwx91x_bt_send(const struct device *dev, struct net_buf *buf)
@@ -101,11 +116,10 @@ static int siwx91x_bt_send(const struct device *dev, struct net_buf *buf)
 	int sc = -EOVERFLOW;
 
 	if (buf->len < sizeof(hci->rsi_data_packet.data)) {
-		memcpy(&hci->rsi_data_packet, buf->data, buf->len);
-		sc = rsi_bt_driver_send_cmd(RSI_BLE_REQ_HCI_RAW, &hci->rsi_data_packet, NULL);
-		/* TODO SILABS ZEPHYR Convert to errno. A common function from rsi/sl_status should
-		 * be introduced
-		 */
+		memcpy(hci->rsi_data_packet.data, buf->data, buf->len);
+		LOG_DBG("HCI TX len %u opcode 0x%04x", buf->len,
+			sys_get_le16(&buf->data[1]));
+		sc = rsi_bt_driver_send_cmd(RSI_BLE_REQ_HCI_RAW, hci->rsi_data_packet.data, NULL);
 		if (sc) {
 			LOG_ERR("BT command send failure: %d", sc);
 			sc = -EIO;
@@ -120,27 +134,100 @@ static int siwx91x_bt_send(const struct device *dev, struct net_buf *buf)
 	return 0;
 }
 
+static bool siwx91x_is_hci_evt_code(uint8_t byte)
+{
+	return byte == BT_HCI_EVT_CMD_COMPLETE || byte == BT_HCI_EVT_CMD_STATUS ||
+	       byte == BT_HCI_EVT_LE_META_EVENT || byte == BT_HCI_EVT_HARDWARE_ERROR;
+}
+
+static bool siwx91x_is_h4_type(uint8_t byte)
+{
+	return byte == BT_HCI_H4_EVT || byte == BT_HCI_H4_ACL;
+}
+
+static bool siwx91x_parse_hci_rsp(const uint8_t *data, uint8_t *packet_type,
+				  const uint8_t **hci_payload)
+{
+	uint8_t type = *(data - 2);
+
+	if (siwx91x_is_h4_type(type)) {
+		*packet_type = type;
+		*hci_payload = data;
+		return true;
+	}
+
+	type = *(data - 12);
+	if (siwx91x_is_h4_type(type)) {
+		*packet_type = type;
+		*hci_payload = data;
+		return true;
+	}
+
+	if (siwx91x_is_h4_type(data[0])) {
+		if (data[0] == BT_HCI_H4_ACL || siwx91x_is_hci_evt_code(data[1])) {
+			*packet_type = data[0];
+			*hci_payload = data + 1;
+			return true;
+		}
+
+		if (siwx91x_is_hci_evt_code(data[12])) {
+			*packet_type = data[0];
+			*hci_payload = data + 12;
+			return true;
+		}
+	}
+
+	if (siwx91x_is_hci_evt_code(data[0])) {
+		*packet_type = BT_HCI_H4_EVT;
+		*hci_payload = data;
+		return true;
+	}
+
+	if (siwx91x_is_hci_evt_code(data[12])) {
+		*packet_type = BT_HCI_H4_EVT;
+		*hci_payload = data + 12;
+		return true;
+	}
+
+	return false;
+}
+
 static void siwx91x_bt_resp_rcvd(uint16_t status, rsi_ble_event_rcp_rcvd_info_t *resp_buf)
 {
 	const struct device *dev = DEVICE_DT_GET(DT_DRV_INST(0));
+	const uint8_t *hci_payload;
 	uint8_t packet_type = BT_HCI_H4_NONE;
 	size_t len = 0;
 	struct net_buf *buf = NULL;
 
-	/* TODO SILABS ZEPHYR This horror expression is from the WiseConnect from the HCI example...
-	 * No workaround have been found until now.
-	 */
-	memcpy(&packet_type, (resp_buf->data - 12), 1);
+	ARG_UNUSED(status);
+
+	/*if (hci->recv == NULL) {
+		LOG_ERR("HCI recv callback not registered");
+		return;
+	}*/
+
+	if (!siwx91x_parse_hci_rsp(resp_buf->data, &packet_type, &hci_payload)) {
+		LOG_ERR("Unknown HCI response (desc14=%02x desc4=%02x data=%02x %02x %02x %02x)",
+			resp_buf->data[-2], resp_buf->data[-12],
+			resp_buf->data[0], resp_buf->data[1], resp_buf->data[2],
+			resp_buf->data[3]);
+		return;
+	}
+
+	LOG_INF("HCI RCP RX status %u type %u evt %02x",
+		status, packet_type, hci_payload[0]);
+
 	switch (packet_type) {
 	case BT_HCI_H4_EVT: {
-		struct bt_hci_evt_hdr *hdr = (void *)resp_buf->data;
+		const struct bt_hci_evt_hdr *hdr = (const void *)hci_payload;
 
 		len = hdr->len + sizeof(*hdr);
 		buf = bt_buf_get_evt(hdr->evt, false, K_FOREVER);
 		break;
 	}
 	case BT_HCI_H4_ACL: {
-		struct bt_hci_acl_hdr *hdr = (void *)resp_buf->data;
+		const struct bt_hci_acl_hdr *hdr = (const void *)hci_payload;
 
 		len = hdr->len + sizeof(*hdr);
 		buf = bt_buf_get_rx(BT_BUF_ACL_IN, K_FOREVER);
@@ -152,8 +239,11 @@ static void siwx91x_bt_resp_rcvd(uint16_t status, rsi_ble_event_rcp_rcvd_info_t 
 	}
 
 	if (buf && (len <= net_buf_tailroom(buf))) {
-		net_buf_add_mem(buf, resp_buf->data, len);
+		net_buf_add_mem(buf, hci_payload, len);
 		bt_hci_recv(dev, buf);
+	} else if (buf) {
+		net_buf_unref(buf);
+		LOG_ERR("HCI response too large (%zu)", len);
 	}
 }
 

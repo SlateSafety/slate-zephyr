@@ -22,7 +22,11 @@ function(wiseconnect_get_ram_config node_var out_var)
     message(FATAL_ERROR "Unsupported RAM size config: ${size_kb}KB")
   endif()
 endfunction()
-wiseconnect_get_ram_config("sram0" RAM_MEM_CONFIG)
+if(CONFIG_SILABS_WISECONNECT_NCP)
+  set(RAM_MEM_CONFIG 2)
+else()
+  wiseconnect_get_ram_config("sram0" RAM_MEM_CONFIG)
+endif()
 
 # Common compile definitions for both SoC and NCP modes
 zephyr_compile_definitions(
@@ -34,7 +38,7 @@ zephyr_compile_definitions(
   SLI_SI91X_MCU_CONFIG_RADIO_BOARD_BASE_VER
   SLI_SI91X_MCU_ENABLE_FLASH_BASED_EXECUTION
   SLI_SI91X_MCU_ENABLE_IPMU_APIS
-  SLI_SI91X_MCU_INTERFACE
+ # SLI_SI91X_MCU_INTERFACE
   SLI_SI91X_ENABLE_OS
   SLI_SI917
   SLI_SI917B0
@@ -266,41 +270,60 @@ if(CONFIG_SILABS_WISECONNECT_NCP)
   zephyr_include_directories(
     # CMSIS RTOS v2 portability layer for CMSIS thread APIs used by WiseConnect SDK
     ${ZEPHYR_BASE}/include/zephyr/portability
-    ${SISDK_DIR}/platform/common/inc
-    ${SISDK_DIR}/platform/common/config
-    ${SISDK_DIR}/platform/emlib/inc
-    ${SISDK_DIR}/platform/service/mem_pool/inc
-    ${WISECONNECT_DIR}/resources/defaults
-    ${WISECONNECT_DIR}/components/common/inc
-    ${WISECONNECT_DIR}/components/device/silabs/si91x/wireless/inc
-    ${WISECONNECT_DIR}/components/device/silabs/si91x/wireless/sl_net/inc
-    ${WISECONNECT_DIR}/components/device/silabs/si91x/wireless/socket/inc
-    ${WISECONNECT_DIR}/components/device/silabs/si91x/wireless/asynchronous_socket/inc
-    ${WISECONNECT_DIR}/components/device/silabs/si91x/wireless/ble/inc
-    ${WISECONNECT_DIR}/components/protocol/wifi/inc
-    ${WISECONNECT_DIR}/components/service/network_manager/inc
-    ${WISECONNECT_DIR}/components/sli_wifi_command_engine/inc
+    ${SISDK}/platform/common/inc
+    ${SISDK}/platform/common/config
+    ${SISDK}/platform/emlib/inc
+    ${SISDK}/platform/service/mem_pool/inc
+    ${WISECONNECT}/resources/defaults
+    ${WISECONNECT}/components/common/inc
+    ${WISECONNECT}/components/device/silabs/si91x/mcu/drivers/service/sl_log/inc
+    ${WISECONNECT}/components/device/silabs/si91x/wireless/inc
+    ${WISECONNECT}/components/device/silabs/si91x/wireless/sl_net/inc
+    ${WISECONNECT}/components/device/silabs/si91x/wireless/socket/inc
+    ${WISECONNECT}/components/device/silabs/si91x/wireless/asynchronous_socket/inc
+    ${WISECONNECT}/components/device/silabs/si91x/wireless/ble/inc
+    ${WISECONNECT}/components/protocol/wifi/inc
+    ${WISECONNECT}/components/service/network_manager/inc
+    ${WISECONNECT}/components/sli_buffer_manager/inc
+    ${WISECONNECT}/components/sli_wifi/inc
+    ${WISECONNECT}/components/sli_wifi_command_engine/inc
     # Board config needed for compilation (symbols not used at runtime)
-    ${WISECONNECT_DIR}/components/board/silabs/config/brd4342a
-    ${WISECONNECT_DIR}/components/device/silabs/si91x/wireless/firmware_upgrade
+    ${WISECONNECT}/components/board/silabs/config/brd4342a
+    ${WISECONNECT}/components/device/silabs/si91x/wireless/firmware_upgrade
   )
   zephyr_library_sources(
     # NCP-compatible platform shims (replace SoC-specific sl_core_cortexm.c
     # and sl_mem_pool.c which require em_device.h)
     sl_core_zephyr.c
-    ${SISDK_DIR}/platform/service/mem_pool/src/sl_mem_pool.c
-    ${WISECONNECT_DIR}/components/common/src/sl_utility.c
-    ${WISECONNECT_DIR}/components/device/silabs/si91x/wireless/memory/mem_pool_buffer_quota.c
-    ${WISECONNECT_DIR}/components/device/silabs/si91x/wireless/src/sl_rsi_utility.c
-    ${WISECONNECT_DIR}/components/device/silabs/si91x/wireless/src/sl_si91x_driver.c
-    ${WISECONNECT_DIR}/components/protocol/wifi/si91x/sl_wifi.c
-    ${WISECONNECT_DIR}/components/protocol/wifi/src/sl_wifi_callback_framework.c
-    ${WISECONNECT_DIR}/components/service/network_manager/src/sli_net_common_utility.c
-    ${WISECONNECT_DIR}/components/sli_si91x_wifi_event_handler/src/sli_si91x_wifi_event_handler.c
-    ${WISECONNECT_DIR}/components/sli_wifi_command_engine/src/sli_wifi_command_engine.c
+    nwp_fw_version.c
+    ${SISDK}/platform/common/src/sl_string.c
+    ${SISDK}/platform/service/mem_pool/src/sl_mem_pool.c
+    ${WISECONNECT}/components/common/src/sl_utility.c
+    ${WISECONNECT}/components/device/silabs/si91x/wireless/memory/mem_pool_buffer_quota.c
+    ${WISECONNECT}/components/device/silabs/si91x/wireless/src/sl_rsi_utility.c
+    ${WISECONNECT}/components/device/silabs/si91x/wireless/src/sl_si91x_driver.c
+    ${WISECONNECT}/components/device/silabs/si91x/wireless/src/sli_wifi_memory_manager.c
+    ${WISECONNECT}/components/device/silabs/si91x/wireless/src/sli_wifi_power_profile.c
+    ${WISECONNECT}/components/protocol/wifi/si91x/sl_wifi.c
+    ${WISECONNECT}/components/protocol/wifi/src/sli_wifi_callback_framework.c
+    ${WISECONNECT}/components/protocol/wifi/src/sl_wifi_callback_framework.c
+    ${WISECONNECT}/components/service/network_manager/src/sli_net_common_utility.c
+    ${WISECONNECT}/components/sli_si91x_wifi_event_handler/src/sli_si91x_wifi_event_handler.c
+    ${WISECONNECT}/components/sli_wifi/src/sli_wifi.c
+    ${WISECONNECT}/components/sli_wifi/src/sli_wifi_utility.c
+    ${WISECONNECT}/components/sli_wifi_command_engine/src/sli_wifi_command_engine.c
     # NCP SPI bus protocol sources
-    ${WISECONNECT_DIR}/components/device/silabs/si91x/wireless/ncp_interface/spi/sl_si91x_spi.c
-    ${WISECONNECT_DIR}/components/device/silabs/si91x/wireless/ncp_interface/sl_si91x_ncp_driver.c
+    ${WISECONNECT}/components/device/silabs/si91x/wireless/ncp_interface/spi/sl_si91x_spi.c
+    ${WISECONNECT}/components/device/silabs/si91x/wireless/ncp_interface/sl_si91x_ncp_driver.c
+  )
+  zephyr_compile_definitions_ifdef(CONFIG_BT_SILABS_SIWX91X
+    SLI_SI91X_ENABLE_BLE
+  )
+  zephyr_library_sources_ifdef(CONFIG_BT_SILABS_SIWX91X
+    ${WISECONNECT}/components/device/silabs/si91x/wireless/ble/src/rsi_bt_ble.c
+    ${WISECONNECT}/components/device/silabs/si91x/wireless/ble/src/rsi_common_apis.c
+    ${WISECONNECT}/components/device/silabs/si91x/wireless/ble/src/rsi_utils.c
+    ${WISECONNECT}/components/device/silabs/si91x/wireless/ble/src/sl_si91x_ble.c
   )
   zephyr_include_directories(.)
 endif() # CONFIG_SILABS_WISECONNECT_NCP
@@ -380,7 +403,7 @@ if(CONFIG_SILABS_SIWX91X_NWP)
   )
 endif() # CONFIG_SILABS_SIWX91X_NWP
 
-if(CONFIG_SILABS_SISDK_SLEEPTIMER)
+if(CONFIG_SILABS_SISDK_SLEEPTIMER AND CONFIG_SOC_FAMILY_SILABS_SIWX91X)
   zephyr_include_directories(
     ${SISDK}/platform/service/sleeptimer/src
   )
@@ -400,7 +423,7 @@ if(CONFIG_SILABS_SISDK_SLEEPTIMER)
   )
 endif() # CONFIG_SILABS_SISDK_SLEEPTIMER
 
-if(CONFIG_PM)
+if(CONFIG_PM AND CONFIG_SOC_FAMILY_SILABS_SIWX91X)
   zephyr_library_sources(
     ${WISECONNECT}/components/device/silabs/si91x/mcu/core/chip/src/rsi_ps_ram_func.c
     ${WISECONNECT}/components/device/silabs/si91x/mcu/drivers/peripheral_drivers/src/sl_si91x_m4_ps.c
