@@ -565,20 +565,20 @@ static void siwx91x_ncp_configure_sta_mode(sl_si91x_boot_configuration_t *boot_c
 	boot_config->ext_custom_feature_bit_map |= SL_SI91X_EXT_FEAT_BT_CUSTOM_FEAT_ENABLE;
 	boot_config->bt_feature_bit_map |= SL_SI91X_BT_RF_TYPE | SL_SI91X_ENABLE_BLE_PROTOCOL;
 	boot_config->ble_feature_bit_map |=
-		SL_SI91X_BLE_MAX_NBR_PERIPHERALS(3) |
-		SL_SI91X_BLE_MAX_NBR_CENTRALS(1) |
+		SL_SI91X_BLE_MAX_NBR_ATT_REC(124) |
 		SL_SI91X_BLE_MAX_NBR_ATT_SERV(10) |
-		SL_SI91X_BLE_MAX_NBR_ATT_REC(80) |
-		SL_SI91X_BLE_PWR_INX(63) |
+		SL_SI91X_BLE_MAX_NBR_PERIPHERALS(8) |
+		SL_SI91X_BLE_PWR_INX(31) |
 		SL_SI91X_BLE_PWR_SAVE_OPTIONS(0) |
+		SL_SI91X_BLE_MAX_NBR_CENTRALS(2) |
+		SL_SI91X_BLE_GATT_ASYNC_ENABLE |
 		SL_SI91X_916_BLE_COMPATIBLE_FEAT_ENABLE |
-		SL_SI91X_FEAT_BLE_CUSTOM_FEAT_EXTENTION_VALID;
+		SL_SI91X_FEAT_BLE_CUSTOM_FEAT_EXTENSION_VALID;
 
 	boot_config->ble_ext_feature_bit_map |=
-		SL_SI91X_BLE_NUM_CONN_EVENTS(20) |
-		SL_SI91X_BLE_NUM_REC_BYTES(0x40) | SL_SI91X_BLE_ENABLE_ADV_EXTN |
+		SL_SI91X_BLE_NUM_CONN_EVENTS(20) | SL_SI91X_BLE_ENABLE_ADV_EXTN |
 		SL_SI91X_BLE_GATT_INIT |
-		BIT(23) |
+		SL_SI91X_BT_BLE_STACK_BYPASS_ENABLE |
 		SL_SI91X_BLE_AE_MAX_ADV_SETS(2);
 #endif
 }
@@ -657,7 +657,7 @@ static int siwx91x_ncp_get_config(const struct device *dev,
 			.tcp_ip_feature_bit_map = SL_SI91X_TCP_IP_FEAT_EXTENSION_VALID,
 			.custom_feature_bit_map = SL_SI91X_CUSTOM_FEAT_EXTENSION_VALID,
 			.ext_custom_feature_bit_map =
-				MEMORY_CONFIG,
+				MEMORY_CONFIG | BIT(23),
 		}
 	};
 
