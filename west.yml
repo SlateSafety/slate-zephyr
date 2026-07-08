@@ -251,10 +251,10 @@ manifest:
         - hal
     - name: hal_silabs
 #<<<<<<< HEAD
-      revision: d91d60465ca99b0a8e44a429769ee759843267f7
+      # revision: d91d60465ca99b0a8e44a429769ee759843267f7
 #=======
-      #remote: slatesafety
-      #revision: 40219782e0370ebfeca5f4fb223faf2c82d2afff
+      remote: slatesafety
+      revision: f78d10fa5ae03002920edfa9c6436a1286801279
 #>>>>>>> de36d51ac0b (Point hal_silabs remote to SlateSafety fork)
       path: modules/hal/silabs
       groups:
