@@ -113,8 +113,16 @@ unsigned int siwx91x_wifi_module_stats_event_handler(sl_wifi_event_t event, unsi
 unsigned int siwx91x_on_join(sl_wifi_event_t event, unsigned int status,
 			     void *data, uint32_t data_length, void *arg)
 {
-	char result = *(char *)data;
 	struct siwx91x_dev *sidev = arg;
+	if (data == NULL && arg != NULL) {
+		wifi_mgmt_raise_connect_result_event(sidev->iface, WIFI_STATUS_CONN_FAIL);
+		sidev->state = WIFI_STATE_INACTIVE;
+		return 0;
+	} else if (data == NULL && arg == NULL) {
+		return -EINVAL;
+	}
+
+	char result = *(char *)data;
 
 	if (result != 'C') {
 		/* TODO: report the real reason of failure */
