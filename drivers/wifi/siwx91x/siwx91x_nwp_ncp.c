@@ -835,6 +835,17 @@ static int siwx91x_nwp_ncp_init(const struct device *dev)
 		return -EINVAL;
 	}
 
+	sl_mac_address_t mac_addr;
+
+	ret = sl_wifi_get_mac_address(SL_WIFI_CLIENT_INTERFACE, &mac_addr);
+	if (ret == SL_STATUS_OK) {
+		LOG_INF("SiWx91x MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+			mac_addr.octet[0], mac_addr.octet[1], mac_addr.octet[2],
+			mac_addr.octet[3], mac_addr.octet[4], mac_addr.octet[5]);
+	} else {
+		LOG_WRN("Failed to read SiWx91x MAC address: 0x%x", ret);
+	}
+
 	/* Use HIGH_PERFORMANCE until sleep/wake GPIO handshaking is implemented.
 	 * ASSOCIATED_POWER_SAVE requires the sleep-request and wake-indicator GPIOs
 	 * to be functional — without them the NWP may sleep and never wake for SPI
