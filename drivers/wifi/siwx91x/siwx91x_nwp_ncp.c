@@ -19,6 +19,8 @@
 
 #define DT_DRV_COMPAT silabs_siwx91x_nwp_spi
 
+#include <stdlib.h>
+
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
@@ -26,6 +28,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/net/wifi.h>
+#include <zephyr/shell/shell.h>
 #include <zephyr/sys/util.h>
 
 #include "siwx91x_nwp.h"
@@ -69,7 +72,341 @@ struct siwx91x_ncp_data {
 	struct gpio_callback irq_cb_data;
 	struct spi_config spi_cfg;
 	volatile bool bus_irq_enabled;
+	sl_wifi_transmitter_test_info_t wifi_tx_test_cfg;
+	bool wifi_tx_test_running;
 };
+
+/* Singleton device pointer used by both host interface callbacks and shell CLI. */
+static const struct device *ncp_dev_instance;
+
+static void siwx91x_wifi_tx_test_set_defaults(sl_wifi_transmitter_test_info_t *cfg)
+{
+	memset(cfg, 0, sizeof(*cfg));
+	cfg->enable = 1;
+	cfg->power = 18;
+	cfg->rate = 0;
+	cfg->length = 200;
+	cfg->mode = 1;
+	cfg->channel = 11;
+}
+
+static int siwx91x_wifi_freq_mhz_to_channel(uint16_t freq_mhz, uint16_t *channel)
+{
+	if (freq_mhz < 2412 || freq_mhz > 2472) {
+		return -EINVAL;
+	}
+
+	if (((freq_mhz - 2407U) % 5U) != 0U) {
+		return -EINVAL;
+	}
+
+	*channel = (uint16_t)((freq_mhz - 2407U) / 5U);
+	if (*channel < 1U || *channel > 13U) {
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static bool siwx91x_wifi_tx_length_is_valid(const sl_wifi_transmitter_test_info_t *cfg)
+{
+	if (cfg->mode == 1U) {
+		return (cfg->length >= 24U) && (cfg->length <= 260U);
+	}
+
+	return (cfg->length >= 24U) && (cfg->length <= 1500U);
+}
+
+static int siwx91x_wifi_tx_test_start_internal(const struct device *dev)
+{
+	struct siwx91x_ncp_data *data = dev->data;
+	sl_status_t status;
+
+	if (!siwx91x_wifi_tx_length_is_valid(&data->wifi_tx_test_cfg)) {
+		LOG_ERR("Invalid length %u for mode %u", data->wifi_tx_test_cfg.length,
+			data->wifi_tx_test_cfg.mode);
+		return -EINVAL;
+	}
+
+	if (data->wifi_tx_test_running) {
+		status = sl_wifi_transmit_test_stop(SL_WIFI_CLIENT_INTERFACE);
+		if (status != SL_STATUS_OK) {
+			LOG_ERR("Failed to stop active WiFi TX test: 0x%x", status);
+			return -EIO;
+		}
+		data->wifi_tx_test_running = false;
+		k_msleep(10);
+	}
+
+	data->wifi_tx_test_cfg.enable = 1;
+	status = sl_wifi_transmit_test_start(SL_WIFI_CLIENT_INTERFACE, &data->wifi_tx_test_cfg);
+	if (status != SL_STATUS_OK) {
+		LOG_ERR("Failed to start WiFi TX test: 0x%x", status);
+		return -EIO;
+	}
+
+	data->wifi_tx_test_running = true;
+	LOG_INF("WiFi TX test started: ch=%u power=%u rate=%u mode=%u len=%u",
+		data->wifi_tx_test_cfg.channel, data->wifi_tx_test_cfg.power,
+		data->wifi_tx_test_cfg.rate, data->wifi_tx_test_cfg.mode,
+		data->wifi_tx_test_cfg.length);
+
+	return 0;
+}
+
+static int siwx91x_wifi_tx_test_stop_internal(const struct device *dev)
+{
+	struct siwx91x_ncp_data *data = dev->data;
+	sl_status_t status;
+
+	if (!data->wifi_tx_test_running) {
+		return 0;
+	}
+
+	status = sl_wifi_transmit_test_stop(SL_WIFI_CLIENT_INTERFACE);
+	if (status != SL_STATUS_OK) {
+		LOG_ERR("Failed to stop WiFi TX test: 0x%x", status);
+		return -EIO;
+	}
+
+	data->wifi_tx_test_running = false;
+	LOG_INF("WiFi TX test stopped");
+	return 0;
+}
+
+#if defined(CONFIG_SHELL)
+static int siwx91x_wifi_tx_shell_print_cfg(const struct shell *shell,
+					    const struct siwx91x_ncp_data *data)
+{
+	shell_print(shell, "running=%u channel=%u freq_mhz=%u power=%u rate=%u mode=%u length=%u",
+		    data->wifi_tx_test_running ? 1U : 0U,
+		    data->wifi_tx_test_cfg.channel,
+		    (uint16_t)(2407U + (5U * data->wifi_tx_test_cfg.channel)),
+		    data->wifi_tx_test_cfg.power,
+		    data->wifi_tx_test_cfg.rate,
+		    data->wifi_tx_test_cfg.mode,
+		    data->wifi_tx_test_cfg.length);
+
+	return 0;
+}
+
+static int cmd_siwx917_wifi_tx_show(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	if (ncp_dev_instance == NULL) {
+		shell_error(shell, "NCP device not initialized");
+		return -ENODEV;
+	}
+
+	const struct siwx91x_ncp_data *data = ncp_dev_instance->data;
+	return siwx91x_wifi_tx_shell_print_cfg(shell, data);
+}
+
+static int cmd_siwx917_wifi_tx_set_channel(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+
+	if (ncp_dev_instance == NULL) {
+		shell_error(shell, "NCP device not initialized");
+		return -ENODEV;
+	}
+
+	unsigned long val = strtoul(argv[1], NULL, 0);
+	if (val < 1UL || val > 13UL) {
+		shell_error(shell, "channel must be 1..13 for 2.4 GHz");
+		return -EINVAL;
+	}
+
+	struct siwx91x_ncp_data *data = ncp_dev_instance->data;
+	data->wifi_tx_test_cfg.channel = (uint16_t)val;
+	shell_print(shell, "wifi tx channel=%u", data->wifi_tx_test_cfg.channel);
+	return 0;
+}
+
+static int cmd_siwx917_wifi_tx_set_freq(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+
+	if (ncp_dev_instance == NULL) {
+		shell_error(shell, "NCP device not initialized");
+		return -ENODEV;
+	}
+
+	unsigned long val = strtoul(argv[1], NULL, 0);
+	uint16_t channel;
+
+	if (val > UINT16_MAX || siwx91x_wifi_freq_mhz_to_channel((uint16_t)val, &channel) < 0) {
+		shell_error(shell, "freq_mhz must be 2412..2472 in 5 MHz steps");
+		return -EINVAL;
+	}
+
+	struct siwx91x_ncp_data *data = ncp_dev_instance->data;
+	data->wifi_tx_test_cfg.channel = channel;
+	shell_print(shell, "wifi tx freq_mhz=%u (channel=%u)", (uint16_t)val,
+		    data->wifi_tx_test_cfg.channel);
+	return 0;
+}
+
+static int cmd_siwx917_wifi_tx_set_power(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+
+	if (ncp_dev_instance == NULL) {
+		shell_error(shell, "NCP device not initialized");
+		return -ENODEV;
+	}
+
+	unsigned long val = strtoul(argv[1], NULL, 0);
+	if (!((val >= 2UL && val <= 18UL) || val == 127UL)) {
+		shell_error(shell, "power must be 2..18 dBm or 127 (region max)");
+		return -EINVAL;
+	}
+
+	struct siwx91x_ncp_data *data = ncp_dev_instance->data;
+	data->wifi_tx_test_cfg.power = (uint16_t)val;
+	shell_print(shell, "wifi tx power=%u", data->wifi_tx_test_cfg.power);
+	return 0;
+}
+
+static int cmd_siwx917_wifi_tx_set_mode(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+
+	if (ncp_dev_instance == NULL) {
+		shell_error(shell, "NCP device not initialized");
+		return -ENODEV;
+	}
+
+	unsigned long val = strtoul(argv[1], NULL, 0);
+	if (val > 4UL) {
+		shell_error(shell, "mode must be 0..4");
+		return -EINVAL;
+	}
+
+	struct siwx91x_ncp_data *data = ncp_dev_instance->data;
+	data->wifi_tx_test_cfg.mode = (uint16_t)val;
+
+	if (!siwx91x_wifi_tx_length_is_valid(&data->wifi_tx_test_cfg)) {
+		data->wifi_tx_test_cfg.length = (val == 1UL) ? 260U : 200U;
+	}
+
+	shell_print(shell, "wifi tx mode=%u", data->wifi_tx_test_cfg.mode);
+	return 0;
+}
+
+static int cmd_siwx917_wifi_tx_set_rate(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+
+	if (ncp_dev_instance == NULL) {
+		shell_error(shell, "NCP device not initialized");
+		return -ENODEV;
+	}
+
+	unsigned long val = strtoul(argv[1], NULL, 0);
+	if (val > UINT32_MAX) {
+		shell_error(shell, "invalid rate value");
+		return -EINVAL;
+	}
+
+	struct siwx91x_ncp_data *data = ncp_dev_instance->data;
+	data->wifi_tx_test_cfg.rate = (uint32_t)val;
+	shell_print(shell, "wifi tx rate=%u", (unsigned int)data->wifi_tx_test_cfg.rate);
+	return 0;
+}
+
+static int cmd_siwx917_wifi_tx_set_length(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+
+	if (ncp_dev_instance == NULL) {
+		shell_error(shell, "NCP device not initialized");
+		return -ENODEV;
+	}
+
+	unsigned long val = strtoul(argv[1], NULL, 0);
+	if (val > UINT16_MAX) {
+		shell_error(shell, "invalid length value");
+		return -EINVAL;
+	}
+
+	struct siwx91x_ncp_data *data = ncp_dev_instance->data;
+	data->wifi_tx_test_cfg.length = (uint16_t)val;
+
+	if (!siwx91x_wifi_tx_length_is_valid(&data->wifi_tx_test_cfg)) {
+		shell_error(shell,
+			    "length invalid for mode %u (mode 1: 24..260, other modes: 24..1500)",
+			    data->wifi_tx_test_cfg.mode);
+		return -EINVAL;
+	}
+
+	shell_print(shell, "wifi tx length=%u", data->wifi_tx_test_cfg.length);
+	return 0;
+}
+
+static int cmd_siwx917_wifi_tx_start(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	if (ncp_dev_instance == NULL) {
+		shell_error(shell, "NCP device not initialized");
+		return -ENODEV;
+	}
+
+	int ret = siwx91x_wifi_tx_test_start_internal(ncp_dev_instance);
+	if (ret < 0) {
+		shell_error(shell, "failed to start wifi tx test: %d", ret);
+		return ret;
+	}
+
+	const struct siwx91x_ncp_data *data = ncp_dev_instance->data;
+	return siwx91x_wifi_tx_shell_print_cfg(shell, data);
+}
+
+static int cmd_siwx917_wifi_tx_stop(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	if (ncp_dev_instance == NULL) {
+		shell_error(shell, "NCP device not initialized");
+		return -ENODEV;
+	}
+
+	int ret = siwx91x_wifi_tx_test_stop_internal(ncp_dev_instance);
+	if (ret < 0) {
+		shell_error(shell, "failed to stop wifi tx test: %d", ret);
+		return ret;
+	}
+
+	shell_print(shell, "wifi tx stopped");
+	return 0;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(siwx917_wifi_tx_cmds,
+	SHELL_CMD_ARG(show, NULL, "Show WiFi TX test configuration", cmd_siwx917_wifi_tx_show, 1, 0),
+	SHELL_CMD_ARG(channel, NULL, "Set WiFi TX channel (1..13)", cmd_siwx917_wifi_tx_set_channel, 2,
+		      0),
+	SHELL_CMD_ARG(freq, NULL, "Set WiFi TX center frequency MHz (2412..2472 step 5)",
+		      cmd_siwx917_wifi_tx_set_freq, 2, 0),
+	SHELL_CMD_ARG(power, NULL, "Set WiFi TX power dBm (2..18 or 127)",
+		      cmd_siwx917_wifi_tx_set_power, 2, 0),
+	SHELL_CMD_ARG(mode, NULL, "Set WiFi TX mode (0..4)", cmd_siwx917_wifi_tx_set_mode, 2, 0),
+	SHELL_CMD_ARG(rate, NULL, "Set WiFi TX rate code (e.g. 0, 139, 256)",
+		      cmd_siwx917_wifi_tx_set_rate, 2, 0),
+	SHELL_CMD_ARG(length, NULL, "Set WiFi TX payload length", cmd_siwx917_wifi_tx_set_length, 2,
+		      0),
+	SHELL_CMD_ARG(start, NULL, "Start WiFi TX test", cmd_siwx917_wifi_tx_start, 1, 0),
+	SHELL_CMD_ARG(stop, NULL, "Stop WiFi TX test", cmd_siwx917_wifi_tx_stop, 1, 0),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_CMD_ARG_REGISTER(siwx917_wifi_tx, &siwx917_wifi_tx_cmds,
+		       "SiWx917 WiFi TX test CLI", NULL, 1, 0);
+#endif
 
 /* We support exactly one instance (singleton) */
 BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) <= 1,
@@ -78,7 +415,6 @@ BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) <= 1,
 /* Pointer to the singleton device — needed by the sl_si91x_host_*() functions
  * which have no device parameter (they are global platform callbacks).
  */
-static const struct device *ncp_dev_instance;
 
 /* ========================================================================== */
 /* Country code / region mapping (shared with SoC NWP driver)                  */
@@ -531,7 +867,7 @@ static void siwx91x_ncp_configure_sta_mode(sl_si91x_boot_configuration_t *boot_c
 	const bool wifi_enabled = IS_ENABLED(CONFIG_WIFI_SILABS_SIWX91X);
 	const bool bt_enabled = IS_ENABLED(CONFIG_BT_SILABS_SIWX91X);
 
-	boot_config->oper_mode = SL_SI91X_CLIENT_MODE;
+	boot_config->oper_mode = SL_SI91X_TRANSMIT_TEST_MODE;
 
 	if (IS_ENABLED(CONFIG_WIFI_SILABS_SIWX91X_ROAMING_USE_DEAUTH)) {
 		boot_config->custom_feature_bit_map |=
@@ -650,14 +986,20 @@ static int siwx91x_ncp_get_config(const struct device *dev,
 		.band        = SL_WIFI_BAND_MODE_2_4GHZ,
 		.region_code = SL_WIFI_IGNORE_REGION,
 		.boot_config = {
-			.oper_mode              = SL_SI91X_CLIENT_MODE,
+			.oper_mode              = SL_SI91X_TRANSMIT_TEST_MODE,
 			.feature_bit_map = SL_SI91X_FEAT_SECURITY_OPEN | SL_SI91X_FEAT_WPS_DISABLE |
 					   SL_SI91X_FEAT_SECURITY_PSK | SL_SI91X_FEAT_AGGREGATION |
 					   SL_SI91X_FEAT_HIDE_PSK_CREDENTIALS,
 			.tcp_ip_feature_bit_map = SL_SI91X_TCP_IP_FEAT_EXTENSION_VALID,
 			.custom_feature_bit_map = SL_SI91X_CUSTOM_FEAT_EXTENSION_VALID,
 			.ext_custom_feature_bit_map =
-				MEMORY_CONFIG | BIT(23),
+				SL_SI91X_EXT_FEAT_XTAL_CLK | 
+				SL_SI91X_EXT_FEAT_DISABLE_XTAL_CORRECTION |
+				SL_SI91X_EXT_FEAT_UART_SEL_FOR_DEBUG_PRINTS |
+				SL_SI91X_EXT_FEAT_NWP_QSPI_80MHZ_CLK_ENABLE |
+				SL_SI91X_EXT_FEAT_672K_M4SS_0K |
+				SL_SI91X_EXT_FEAT_FRONT_END_INTERNAL_SWITCH |
+				SL_SI91X_EXT_FEAT_XTAL_CLK,
 		}
 	};
 
@@ -741,7 +1083,7 @@ int siwx91x_nwp_apply_power_profile(const struct device *dev,
 				    const sl_wifi_performance_profile_v2_t *wifi_profile)
 {
 	sl_wifi_performance_profile_v2_t profile = {
-		.profile = HIGH_PERFORMANCE,
+		.profile = SL_WIFI_SYSTEM_HIGH_PERFORMANCE,
 	};
 	int ret;
 
@@ -874,6 +1216,9 @@ static int siwx91x_nwp_ncp_init(const struct device *dev)
 	}
 
 	LOG_INF("SiWx91x NCP NWP initialized successfully");
+	siwx91x_wifi_tx_test_set_defaults(&data->wifi_tx_test_cfg);
+	data->wifi_tx_test_running = false;
+
 	return 0;
 }
 
