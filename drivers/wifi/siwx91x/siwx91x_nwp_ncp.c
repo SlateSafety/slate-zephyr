@@ -28,6 +28,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/net/wifi.h>
+#include <zephyr/pm/policy.h>
 #include <zephyr/shell/shell.h>
 #include <zephyr/sys/util.h>
 
@@ -87,6 +88,38 @@ struct siwx91x_ncp_data {
 
 /* Singleton device pointer used by both host interface callbacks and shell CLI. */
 static const struct device *ncp_dev_instance;
+static bool siwx91x_pm_lock_held;
+
+static void siwx91x_pm_lock_take(void)
+{
+#if defined(CONFIG_PM)
+	if (siwx91x_pm_lock_held) {
+		return;
+	}
+
+	/* Keep host awake while shell-driven RF tests and NCP command traffic are active. */
+	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_RAM, PM_ALL_SUBSTATES);
+	pm_policy_state_lock_get(PM_STATE_STANDBY, PM_ALL_SUBSTATES);
+	siwx91x_pm_lock_held = true;
+	LOG_INF("PM policy lock acquired for SiWx91x NCP");
+#endif
+}
+
+static void siwx91x_pm_lock_release(void)
+{
+#if defined(CONFIG_PM)
+	if (!siwx91x_pm_lock_held) {
+		return;
+	}
+
+	pm_policy_state_lock_put(PM_STATE_STANDBY, PM_ALL_SUBSTATES);
+	pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_RAM, PM_ALL_SUBSTATES);
+	pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+	siwx91x_pm_lock_held = false;
+	LOG_INF("PM policy lock released for SiWx91x NCP");
+#endif
+}
 
 static void siwx91x_wifi_tx_test_set_defaults(sl_wifi_transmitter_test_info_t *cfg)
 {
@@ -1147,6 +1180,7 @@ sl_status_t sl_si91x_host_deinit(void)
 	data->bus_irq_enabled = false;
 	gpio_pin_interrupt_configure_dt(&cfg->irq_gpio, GPIO_INT_DISABLE);
 	gpio_remove_callback(cfg->irq_gpio.port, &data->irq_cb_data);
+	siwx91x_pm_lock_release();
 
 	LOG_INF("SiWx91x NCP SPI host deinitialized");
 	return SL_STATUS_OK;
@@ -1700,6 +1734,7 @@ static int siwx91x_nwp_ncp_init(const struct device *dev)
 
 	/* Store singleton reference for sl_si91x_host_*() callbacks */
 	ncp_dev_instance = dev;
+	siwx91x_pm_lock_take();
 
 	/* Initialize SPI configuration from DT */
 	const struct siwx91x_ncp_config *cfg = dev->config;
