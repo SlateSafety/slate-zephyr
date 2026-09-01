@@ -247,6 +247,17 @@ config SIWX91X_NCP_RESET_DELAY_MS
 	  Time to wait after releasing reset before attempting SPI
 	  communication. The module bootloader needs time to initialize.
 
+config SIWX91X_NCP_BLE_RF_TEST
+	bool "Enable SiWx91x BLE RF test APIs without Zephyr BT host"
+	default n
+	help
+	  Enables WiseConnect BLE RF test APIs (for example
+	  rsi_ble_per_transmit()) in NCP SPI mode without enabling the
+	  Zephyr Bluetooth host stack.
+
+	  Use this for RF manufacturing/validation test flows where BLE is
+	  controlled directly via WiseConnect APIs.
+
 config BT_SILABS_SIWX91X_NCP_BLE_ONLY_COEX
 	bool "Use BLE-only coexistence on NCP (HCI bring-up)"
 	depends on BT_SILABS_SIWX91X

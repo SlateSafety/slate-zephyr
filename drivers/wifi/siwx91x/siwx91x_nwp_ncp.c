@@ -35,9 +35,12 @@
 #include "nwp_fw_version.h"
 #include "sl_wifi_callback_framework.h"
 #include "sl_si91x_host_interface.h"
+#include "sl_si91x_driver.h"
 
-#ifdef CONFIG_BT_SILABS_SIWX91X
+#if defined(CONFIG_BT_SILABS_SIWX91X) || defined(CONFIG_SIWX91X_NCP_BLE_RF_TEST)
 #include "rsi_ble_common_config.h"
+#include "rsi_ble_apis.h"
+#include "rsi_bt_common_apis.h"
 #include "sl_si91x_ble.h"
 #endif
 
@@ -74,6 +77,12 @@ struct siwx91x_ncp_data {
 	volatile bool bus_irq_enabled;
 	sl_wifi_transmitter_test_info_t wifi_tx_test_cfg;
 	bool wifi_tx_test_running;
+#if defined(CONFIG_BT_SILABS_SIWX91X) || defined(CONFIG_SIWX91X_NCP_BLE_RF_TEST)
+	rsi_ble_per_transmit_t ble_per_tx_cfg;
+	bool ble_per_tx_test_running;
+	bool ble_stack_initialized;
+	bool ble_radio_disabled;
+#endif
 };
 
 /* Singleton device pointer used by both host interface callbacks and shell CLI. */
@@ -173,6 +182,258 @@ static int siwx91x_wifi_tx_test_stop_internal(const struct device *dev)
 	LOG_INF("WiFi TX test stopped");
 	return 0;
 }
+
+#if defined(CONFIG_BT_SILABS_SIWX91X) || defined(CONFIG_SIWX91X_NCP_BLE_RF_TEST)
+static uint16_t siwx91x_ble_per_get_pkt_len(const rsi_ble_per_transmit_t *cfg)
+{
+	return (uint16_t)cfg->pkt_len[0] | ((uint16_t)cfg->pkt_len[1] << 8);
+}
+
+static void siwx91x_ble_per_set_pkt_len(rsi_ble_per_transmit_t *cfg, uint16_t pkt_len)
+{
+	cfg->pkt_len[0] = (uint8_t)(pkt_len & 0xFFU);
+	cfg->pkt_len[1] = (uint8_t)((pkt_len >> 8) & 0xFFU);
+}
+
+static uint32_t siwx91x_ble_per_get_num_pkts(const rsi_ble_per_transmit_t *cfg)
+{
+	return (uint32_t)cfg->num_pkts[0] | ((uint32_t)cfg->num_pkts[1] << 8) |
+	       ((uint32_t)cfg->num_pkts[2] << 16) | ((uint32_t)cfg->num_pkts[3] << 24);
+}
+
+static uint16_t siwx91x_ble_channel_to_freq_mhz(uint8_t ch)
+{
+	if (ch <= 10U) {
+		return (uint16_t)(2404U + (2U * ch));
+	}
+
+	if (ch <= 36U) {
+		return (uint16_t)(2406U + (2U * ch));
+	}
+
+	if (ch == 37U) {
+		return 2402U;
+	}
+
+	if (ch == 38U) {
+		return 2426U;
+	}
+
+	if (ch == 39U) {
+		return 2480U;
+	}
+
+	return 0U;
+}
+
+static void siwx91x_ble_per_tx_test_set_defaults(rsi_ble_per_transmit_t *cfg)
+{
+	memset(cfg, 0, sizeof(*cfg));
+	cfg->cmd_ix = HCI_BLE_TRANSMIT_CMD_ID;
+	cfg->transmit_enable = 1;
+	cfg->access_addr[0] = 0x8E;
+	cfg->access_addr[1] = 0x89;
+	cfg->access_addr[2] = 0xBE;
+	cfg->access_addr[3] = 0xD6;
+	cfg->phy_rate = 1;
+	cfg->rx_chnl_num = 0;
+	cfg->tx_chnl_num = 0;
+	siwx91x_ble_per_set_pkt_len(cfg, 37);
+	cfg->payload_type = 0;
+	cfg->tx_power = 31;
+	cfg->transmit_mode = 1;
+	cfg->scrambler_seed = 5;
+	cfg->le_chnl_type = 1;
+	cfg->freq_hop_en = 0;
+	cfg->ant_sel = 2;
+	cfg->pll_mode = 0;
+	cfg->rf_type = 1;
+	cfg->rf_chain = 2;
+	cfg->inter_pkt_gap = 0;
+}
+
+static bool siwx91x_ble_per_tx_cfg_is_valid(const rsi_ble_per_transmit_t *cfg)
+{
+	const uint16_t pkt_len = siwx91x_ble_per_get_pkt_len(cfg);
+
+	if (cfg->tx_chnl_num > 39U || cfg->rx_chnl_num > 39U) {
+		return false;
+	}
+
+	if (!(cfg->phy_rate == 1U || cfg->phy_rate == 2U || cfg->phy_rate == 4U ||
+	      cfg->phy_rate == 8U)) {
+		return false;
+	}
+
+	if (cfg->tx_power == 0U || cfg->tx_power == 32U) {
+		return false;
+	}
+
+	if (cfg->payload_type > 7U || cfg->transmit_mode > 2U) {
+		return false;
+	}
+
+	if (pkt_len == 0U || pkt_len > 255U) {
+		return false;
+	}
+
+	return true;
+}
+
+static void siwx91x_ble_per_build_minimal_cmd(const struct siwx91x_ncp_data *data,
+						       rsi_ble_per_transmit_t *per_tx,
+						       bool enable)
+{
+	memset(per_tx, 0, sizeof(*per_tx));
+
+	per_tx->cmd_ix = HCI_BLE_TRANSMIT_CMD_ID;
+	per_tx->transmit_enable = enable ? 1U : 0U;
+
+	if (!enable) {
+		return;
+	}
+
+	/* Keep only the core TX knobs to avoid over-constraining firmware defaults. */
+	per_tx->access_addr[0] = data->ble_per_tx_cfg.access_addr[0];
+	per_tx->access_addr[1] = data->ble_per_tx_cfg.access_addr[1];
+	per_tx->access_addr[2] = data->ble_per_tx_cfg.access_addr[2];
+	per_tx->access_addr[3] = data->ble_per_tx_cfg.access_addr[3];
+	per_tx->phy_rate = data->ble_per_tx_cfg.phy_rate;
+	per_tx->rx_chnl_num = data->ble_per_tx_cfg.rx_chnl_num;
+	per_tx->tx_chnl_num = data->ble_per_tx_cfg.tx_chnl_num;
+	per_tx->tx_power = data->ble_per_tx_cfg.tx_power;
+	per_tx->transmit_mode = data->ble_per_tx_cfg.transmit_mode;
+	per_tx->payload_type = data->ble_per_tx_cfg.payload_type;
+	per_tx->inter_pkt_gap = data->ble_per_tx_cfg.inter_pkt_gap;
+	per_tx->pkt_len[0] = data->ble_per_tx_cfg.pkt_len[0];
+	per_tx->pkt_len[1] = data->ble_per_tx_cfg.pkt_len[1];
+	per_tx->le_chnl_type = data->ble_per_tx_cfg.le_chnl_type;
+	per_tx->freq_hop_en = data->ble_per_tx_cfg.freq_hop_en;
+	per_tx->ant_sel = data->ble_per_tx_cfg.ant_sel;
+	per_tx->pll_mode = data->ble_per_tx_cfg.pll_mode;
+	per_tx->rf_type = data->ble_per_tx_cfg.rf_type;
+	per_tx->rf_chain = data->ble_per_tx_cfg.rf_chain;
+
+	if (per_tx->transmit_mode == 1U) {
+		per_tx->scrambler_seed = 5U;
+	}
+}
+
+static int siwx91x_ble_per_tx_test_start_internal(const struct device *dev)
+{
+	struct siwx91x_ncp_data *data = dev->data;
+	rsi_ble_per_transmit_t per_tx;
+	int32_t status;
+	sl_status_t sl_status;
+	int attempt;
+
+	if (!data->ble_radio_disabled) {
+		/* Match WiseConnect BLE test examples: disable radio before BLE test commands. */
+		sl_status = SL_STATUS_TIMEOUT;
+		for (attempt = 0; attempt < 3; attempt++) {
+			sl_status = sl_si91x_disable_radio();
+			if (sl_status == SL_STATUS_OK ||
+			    sl_status == SL_STATUS_SI91X_COMMAND_GIVEN_IN_INVALID_STATE) {
+				break;
+			}
+
+			if (sl_status != SL_STATUS_TIMEOUT) {
+				LOG_ERR("Failed to disable radio for BLE test: 0x%x", (unsigned int)sl_status);
+				return (int)sl_status;
+			}
+
+			k_msleep(20);
+		}
+
+		if (sl_status != SL_STATUS_OK &&
+		    sl_status != SL_STATUS_SI91X_COMMAND_GIVEN_IN_INVALID_STATE) {
+			LOG_ERR("Failed to disable radio for BLE test after retries: 0x%x",
+				(unsigned int)sl_status);
+			return (int)sl_status;
+		}
+
+		data->ble_radio_disabled = true;
+	}
+
+	if (!data->ble_stack_initialized) {
+		status = rsi_bt_init();
+		if (status != 0 && status != RSI_ERROR_COMMAND_GIVEN_IN_WRONG_STATE) {
+			LOG_ERR("BLE stack init failed: %d", (int)status);
+			return (int)status;
+		}
+
+		data->ble_stack_initialized = true;
+	}
+
+	if (!siwx91x_ble_per_tx_cfg_is_valid(&data->ble_per_tx_cfg)) {
+		LOG_ERR("Invalid BLE PER TX configuration");
+		return -EINVAL;
+	}
+
+	if (data->ble_per_tx_test_running) {
+		siwx91x_ble_per_build_minimal_cmd(data, &per_tx, false);
+		status = rsi_ble_per_transmit(&per_tx);
+		if (status != 0) {
+			LOG_ERR("Failed to stop active BLE PER TX: %d", (int)status);
+			return (int)status;
+		}
+		data->ble_per_tx_test_running = false;
+		k_msleep(10);
+	}
+
+	siwx91x_ble_per_build_minimal_cmd(data, &per_tx, true);
+	status = RSI_ERROR_RESPONSE_TIMEOUT;
+	for (attempt = 0; attempt < 3; attempt++) {
+		status = rsi_ble_per_transmit(&per_tx);
+		if (status != (int32_t)SL_STATUS_TIMEOUT) {
+			break;
+		}
+
+		k_msleep(20);
+	}
+	if (status != 0) {
+		LOG_ERR("Failed to start BLE PER TX: %d (cmd_ix=%u ch=%u phy=%u pwr=%u mode=%u len=%u payload=%u)",
+			(int)status, per_tx.cmd_ix, per_tx.tx_chnl_num, per_tx.phy_rate,
+			per_tx.tx_power, per_tx.transmit_mode,
+			siwx91x_ble_per_get_pkt_len(&per_tx), per_tx.payload_type);
+		return (int)status;
+	}
+
+	data->ble_per_tx_test_running = true;
+	LOG_INF("BLE PER TX started: ch=%u (%u MHz) phy=%u pwr=%u mode=%u len=%u payload=%u ch_type=%u rf_type=%u rf_chain=%u",
+		data->ble_per_tx_cfg.tx_chnl_num,
+		siwx91x_ble_channel_to_freq_mhz(data->ble_per_tx_cfg.tx_chnl_num),
+		data->ble_per_tx_cfg.phy_rate,
+		data->ble_per_tx_cfg.tx_power, data->ble_per_tx_cfg.transmit_mode,
+		siwx91x_ble_per_get_pkt_len(&data->ble_per_tx_cfg),
+		data->ble_per_tx_cfg.payload_type, data->ble_per_tx_cfg.le_chnl_type,
+		data->ble_per_tx_cfg.rf_type, data->ble_per_tx_cfg.rf_chain);
+
+	return 0;
+}
+
+static int siwx91x_ble_per_tx_test_stop_internal(const struct device *dev)
+{
+	struct siwx91x_ncp_data *data = dev->data;
+	rsi_ble_per_transmit_t per_tx;
+	int32_t status;
+
+	if (!data->ble_per_tx_test_running) {
+		return 0;
+	}
+
+	siwx91x_ble_per_build_minimal_cmd(data, &per_tx, false);
+	status = rsi_ble_per_transmit(&per_tx);
+	if (status != 0) {
+		LOG_ERR("Failed to stop BLE PER TX: %d", (int)status);
+		return (int)status;
+	}
+
+	data->ble_per_tx_test_running = false;
+	LOG_INF("BLE PER TX stopped");
+	return 0;
+}
+#endif
 
 #if defined(CONFIG_SHELL)
 static int siwx91x_wifi_tx_shell_print_cfg(const struct shell *shell,
@@ -406,6 +667,246 @@ SHELL_STATIC_SUBCMD_SET_CREATE(siwx917_wifi_tx_cmds,
 
 SHELL_CMD_ARG_REGISTER(siwx917_wifi_tx, &siwx917_wifi_tx_cmds,
 		       "SiWx917 WiFi TX test CLI", NULL, 1, 0);
+
+#if defined(CONFIG_BT_SILABS_SIWX91X) || defined(CONFIG_SIWX91X_NCP_BLE_RF_TEST)
+static int siwx91x_ble_tx_shell_print_cfg(const struct shell *shell,
+					   const struct siwx91x_ncp_data *data)
+{
+	shell_print(shell,
+		    "running=%u tx_ch=%u (%u MHz) rx_ch=%u (%u MHz) phy=%u power=%u mode=%u len=%u payload=%u ch_type=%u rf_type=%u rf_chain=%u num_pkts=%u",
+		    data->ble_per_tx_test_running ? 1U : 0U,
+		    data->ble_per_tx_cfg.tx_chnl_num,
+		    siwx91x_ble_channel_to_freq_mhz(data->ble_per_tx_cfg.tx_chnl_num),
+		    data->ble_per_tx_cfg.rx_chnl_num,
+		    siwx91x_ble_channel_to_freq_mhz(data->ble_per_tx_cfg.rx_chnl_num),
+		    data->ble_per_tx_cfg.phy_rate,
+		    data->ble_per_tx_cfg.tx_power,
+		    data->ble_per_tx_cfg.transmit_mode,
+		    siwx91x_ble_per_get_pkt_len(&data->ble_per_tx_cfg),
+		    data->ble_per_tx_cfg.payload_type,
+		    data->ble_per_tx_cfg.le_chnl_type,
+		    data->ble_per_tx_cfg.rf_type,
+		    data->ble_per_tx_cfg.rf_chain,
+		    (unsigned int)siwx91x_ble_per_get_num_pkts(&data->ble_per_tx_cfg));
+
+	return 0;
+}
+
+static int cmd_siwx917_ble_tx_show(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	if (ncp_dev_instance == NULL) {
+		shell_error(shell, "NCP device not initialized");
+		return -ENODEV;
+	}
+
+	const struct siwx91x_ncp_data *data = ncp_dev_instance->data;
+	return siwx91x_ble_tx_shell_print_cfg(shell, data);
+}
+
+static int cmd_siwx917_ble_tx_set_channel(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+
+	if (ncp_dev_instance == NULL) {
+		shell_error(shell, "NCP device not initialized");
+		return -ENODEV;
+	}
+
+	unsigned long val = strtoul(argv[1], NULL, 0);
+	if (val > 39UL) {
+		shell_error(shell, "channel must be 0..39");
+		return -EINVAL;
+	}
+
+	struct siwx91x_ncp_data *data = ncp_dev_instance->data;
+	data->ble_per_tx_cfg.tx_chnl_num = (uint8_t)val;
+	data->ble_per_tx_cfg.rx_chnl_num = (uint8_t)val;
+	/* Advertising channels are 37-39; others are data channels. */
+	data->ble_per_tx_cfg.le_chnl_type = (val >= 37UL) ? 0U : 1U;
+	shell_print(shell, "ble tx channel=%u (%u MHz) ch_type=%u",
+		    data->ble_per_tx_cfg.tx_chnl_num,
+		    siwx91x_ble_channel_to_freq_mhz(data->ble_per_tx_cfg.tx_chnl_num),
+		    data->ble_per_tx_cfg.le_chnl_type);
+	return 0;
+}
+
+static int cmd_siwx917_ble_tx_set_phy(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+
+	if (ncp_dev_instance == NULL) {
+		shell_error(shell, "NCP device not initialized");
+		return -ENODEV;
+	}
+
+	unsigned long val = strtoul(argv[1], NULL, 0);
+	if (!(val == 1UL || val == 2UL || val == 4UL || val == 8UL)) {
+		shell_error(shell, "phy must be one of: 1, 2, 4, 8");
+		return -EINVAL;
+	}
+
+	struct siwx91x_ncp_data *data = ncp_dev_instance->data;
+	data->ble_per_tx_cfg.phy_rate = (uint8_t)val;
+	shell_print(shell, "ble tx phy=%u", data->ble_per_tx_cfg.phy_rate);
+	return 0;
+}
+
+static int cmd_siwx917_ble_tx_set_power(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+
+	if (ncp_dev_instance == NULL) {
+		shell_error(shell, "NCP device not initialized");
+		return -ENODEV;
+	}
+
+	unsigned long val = strtoul(argv[1], NULL, 0);
+	if (val == 0UL || val > 127UL || val == 32UL) {
+		shell_error(shell, "power index must be 1..127 (32 is invalid)");
+		return -EINVAL;
+	}
+
+	struct siwx91x_ncp_data *data = ncp_dev_instance->data;
+	data->ble_per_tx_cfg.tx_power = (uint8_t)val;
+	shell_print(shell, "ble tx power=%u", data->ble_per_tx_cfg.tx_power);
+	return 0;
+}
+
+static int cmd_siwx917_ble_tx_set_length(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+
+	if (ncp_dev_instance == NULL) {
+		shell_error(shell, "NCP device not initialized");
+		return -ENODEV;
+	}
+
+	unsigned long val = strtoul(argv[1], NULL, 0);
+	if (val == 0UL || val > 255UL) {
+		shell_error(shell, "length must be 1..255 bytes");
+		return -EINVAL;
+	}
+
+	struct siwx91x_ncp_data *data = ncp_dev_instance->data;
+	siwx91x_ble_per_set_pkt_len(&data->ble_per_tx_cfg, (uint16_t)val);
+	shell_print(shell, "ble tx length=%u", (unsigned int)val);
+	return 0;
+}
+
+static int cmd_siwx917_ble_tx_set_payload(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+
+	if (ncp_dev_instance == NULL) {
+		shell_error(shell, "NCP device not initialized");
+		return -ENODEV;
+	}
+
+	unsigned long val = strtoul(argv[1], NULL, 0);
+	if (val > 7UL) {
+		shell_error(shell, "payload must be 0..7");
+		return -EINVAL;
+	}
+
+	struct siwx91x_ncp_data *data = ncp_dev_instance->data;
+	data->ble_per_tx_cfg.payload_type = (uint8_t)val;
+	shell_print(shell, "ble tx payload=%u", data->ble_per_tx_cfg.payload_type);
+	return 0;
+}
+
+static int cmd_siwx917_ble_tx_set_mode(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+
+	if (ncp_dev_instance == NULL) {
+		shell_error(shell, "NCP device not initialized");
+		return -ENODEV;
+	}
+
+	unsigned long val = strtoul(argv[1], NULL, 0);
+	if (val > 2UL) {
+		shell_error(shell, "mode must be 0..2");
+		return -EINVAL;
+	}
+
+	struct siwx91x_ncp_data *data = ncp_dev_instance->data;
+	data->ble_per_tx_cfg.transmit_mode = (uint8_t)val;
+	if (data->ble_per_tx_cfg.transmit_mode == 1U) {
+		data->ble_per_tx_cfg.scrambler_seed = 5U;
+	} else if (data->ble_per_tx_cfg.scrambler_seed == 5U) {
+		data->ble_per_tx_cfg.scrambler_seed = 0U;
+	}
+	shell_print(shell, "ble tx mode=%u", data->ble_per_tx_cfg.transmit_mode);
+	return 0;
+}
+
+static int cmd_siwx917_ble_tx_start(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	if (ncp_dev_instance == NULL) {
+		shell_error(shell, "NCP device not initialized");
+		return -ENODEV;
+	}
+
+	int ret = siwx91x_ble_per_tx_test_start_internal(ncp_dev_instance);
+	if (ret != 0) {
+		shell_error(shell, "failed to start BLE PER tx test: %d (0x%x)", ret,
+			    (unsigned int)ret);
+		return ret;
+	}
+
+	const struct siwx91x_ncp_data *data = ncp_dev_instance->data;
+	return siwx91x_ble_tx_shell_print_cfg(shell, data);
+}
+
+static int cmd_siwx917_ble_tx_stop(const struct shell *shell, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	if (ncp_dev_instance == NULL) {
+		shell_error(shell, "NCP device not initialized");
+		return -ENODEV;
+	}
+
+	int ret = siwx91x_ble_per_tx_test_stop_internal(ncp_dev_instance);
+	if (ret != 0) {
+		shell_error(shell, "failed to stop BLE PER tx test: %d (0x%x)", ret,
+			    (unsigned int)ret);
+		return ret;
+	}
+
+	shell_print(shell, "ble tx stopped");
+	return 0;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(siwx917_ble_tx_cmds,
+	SHELL_CMD_ARG(show, NULL, "Show BLE PER TX test configuration", cmd_siwx917_ble_tx_show, 1,
+		      0),
+	SHELL_CMD_ARG(channel, NULL, "Set BLE TX/RX channel (0..39)", cmd_siwx917_ble_tx_set_channel,
+		      2, 0),
+	SHELL_CMD_ARG(phy, NULL, "Set BLE PHY (1, 2, 4, 8)", cmd_siwx917_ble_tx_set_phy, 2, 0),
+	SHELL_CMD_ARG(power, NULL, "Set BLE TX power index (1..127, 32 invalid)",
+		      cmd_siwx917_ble_tx_set_power, 2, 0),
+	SHELL_CMD_ARG(length, NULL, "Set BLE TX packet length (1..255)",
+		      cmd_siwx917_ble_tx_set_length, 2, 0),
+	SHELL_CMD_ARG(payload, NULL, "Set BLE payload type (0..7)", cmd_siwx917_ble_tx_set_payload,
+		      2, 0),
+	SHELL_CMD_ARG(mode, NULL, "Set BLE transmit mode (0 burst, 1 continuous, 2 CW)",
+		      cmd_siwx917_ble_tx_set_mode, 2, 0),
+	SHELL_CMD_ARG(start, NULL, "Start BLE PER TX test", cmd_siwx917_ble_tx_start, 1, 0),
+	SHELL_CMD_ARG(stop, NULL, "Stop BLE PER TX test", cmd_siwx917_ble_tx_stop, 1, 0),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_CMD_ARG_REGISTER(siwx917_ble_tx, &siwx917_ble_tx_cmds,
+		       "SiWx917 BLE PER TX test CLI", NULL, 1, 0);
+#endif
 #endif
 
 /* We support exactly one instance (singleton) */
@@ -865,9 +1366,47 @@ bool sl_si91x_host_is_in_irq_context(void)
 static void siwx91x_ncp_configure_sta_mode(sl_si91x_boot_configuration_t *boot_config)
 {
 	const bool wifi_enabled = IS_ENABLED(CONFIG_WIFI_SILABS_SIWX91X);
-	const bool bt_enabled = IS_ENABLED(CONFIG_BT_SILABS_SIWX91X);
+	const bool bt_enabled = IS_ENABLED(CONFIG_BT_SILABS_SIWX91X) ||
+				IS_ENABLED(CONFIG_SIWX91X_NCP_BLE_RF_TEST);
+	const bool ble_rf_test_only = IS_ENABLED(CONFIG_SIWX91X_NCP_BLE_RF_TEST) &&
+				      !IS_ENABLED(CONFIG_BT_SILABS_SIWX91X);
 
-	boot_config->oper_mode = SL_SI91X_TRANSMIT_TEST_MODE;
+	if (ble_rf_test_only) {
+		/* Keep BLE RF-test boot profile close to WiseConnect BLE examples. */
+		boot_config->oper_mode = SL_SI91X_CLIENT_MODE;
+		boot_config->coex_mode = SL_SI91X_WLAN_BLE_MODE;
+		boot_config->feature_bit_map = SL_SI91X_FEAT_WPS_DISABLE |
+			SL_SI91X_FEAT_ULP_GPIO_BASED_HANDSHAKE |
+			SL_SI91X_FEAT_DEV_TO_HOST_ULP_GPIO_1;
+		boot_config->tcp_ip_feature_bit_map = SL_SI91X_TCP_IP_FEAT_DHCPV4_CLIENT |
+			SL_SI91X_TCP_IP_FEAT_EXTENSION_VALID;
+		boot_config->custom_feature_bit_map = SL_SI91X_CUSTOM_FEAT_EXTENTION_VALID;
+		boot_config->ext_custom_feature_bit_map = SL_SI91X_EXT_FEAT_LOW_POWER_MODE |
+			SL_SI91X_EXT_FEAT_XTAL_CLK |
+			MEMORY_CONFIG |
+			SL_SI91X_EXT_FEAT_FRONT_END_SWITCH_PINS_ULP_GPIO_4_5_0 |
+			SL_SI91X_EXT_FEAT_BT_CUSTOM_FEAT_ENABLE;
+		boot_config->bt_feature_bit_map = SL_SI91X_BT_RF_TYPE |
+			SL_SI91X_ENABLE_BLE_PROTOCOL;
+		boot_config->ext_tcp_ip_feature_bit_map = SL_SI91X_CONFIG_FEAT_EXTENSION_VALID;
+		boot_config->ble_feature_bit_map =
+			SL_SI91X_BLE_MAX_NBR_ATT_REC(80) |
+			SL_SI91X_BLE_MAX_NBR_ATT_SERV(10) |
+			SL_SI91X_BLE_MAX_NBR_PERIPHERALS(1) |
+			SL_SI91X_BLE_PWR_INX(31) |
+			SL_SI91X_BLE_PWR_SAVE_OPTIONS(0) |
+			SL_SI91X_BLE_MAX_NBR_CENTRALS(1) |
+			SL_SI91X_916_BLE_COMPATIBLE_FEAT_ENABLE |
+			SL_SI91X_FEAT_BLE_CUSTOM_FEAT_EXTENSION_VALID;
+		boot_config->ble_ext_feature_bit_map =
+			SL_SI91X_BLE_NUM_CONN_EVENTS(20) |
+			SL_SI91X_BLE_NUM_REC_BYTES(64);
+		boot_config->config_feature_bit_map = 0;
+		return;
+	}
+
+	boot_config->oper_mode = ble_rf_test_only ? SL_SI91X_CLIENT_MODE :
+				      SL_SI91X_TRANSMIT_TEST_MODE;
 
 	if (IS_ENABLED(CONFIG_WIFI_SILABS_SIWX91X_ROAMING_USE_DEAUTH)) {
 		boot_config->custom_feature_bit_map |=
@@ -875,48 +1414,67 @@ static void siwx91x_ncp_configure_sta_mode(sl_si91x_boot_configuration_t *boot_c
 			SL_SI91X_CUSTOM_FEAT_WAKE_ON_WIRELESS | SL_SI91X_CUSTOM_FEAT_EXTENTION_VALID;
 	}
 
-	if (wifi_enabled && bt_enabled) {
+	if (ble_rf_test_only) {
+		boot_config->coex_mode = SL_SI91X_BLE_MODE;
+	} else if (wifi_enabled && bt_enabled) {
 		LOG_ERR("WiFi + Bluetooth coexistence is not fully supported in STA mode; using WLAN_BLE_MODE which has limited BT features");
 		boot_config->coex_mode = SL_SI91X_WLAN_BLE_MODE;
 	} else if (wifi_enabled) {
-		boot_config->coex_mode = SL_SI91X_WLAN_ONLY_MODE;
+		boot_config->coex_mode = SL_SI91X_WLAN_BLE_MODE;
 	} else if (bt_enabled) {
 		boot_config->coex_mode = SL_SI91X_WLAN_BLE_MODE;
 	} else {
-		boot_config->coex_mode = SL_SI91X_WLAN_ONLY_MODE;
+		boot_config->coex_mode = SL_SI91X_WLAN_BLE_MODE;
 	}
 
 #ifdef CONFIG_WIFI_SILABS_SIWX91X
-	/* 802.11W (management frame protection) — needed for WPA3 */
-	boot_config->ext_custom_feature_bit_map |= SL_SI91X_EXT_FEAT_IEEE_80211W | SL_SI91X_EXT_FEAT_FRONT_END_SWITCH_PINS_ULP_GPIO_4_5_0;
+	if (!ble_rf_test_only) {
+		/* 802.11W (management frame protection) — needed for WPA3 */
+		boot_config->ext_custom_feature_bit_map |= SL_SI91X_EXT_FEAT_IEEE_80211W |
+			SL_SI91X_EXT_FEAT_FRONT_END_SWITCH_PINS_ULP_GPIO_4_5_0;
 
-	if (IS_ENABLED(CONFIG_WIFI_SILABS_SIWX91X_ENHANCED_MAX_PSP)) {
-		boot_config->config_feature_bit_map = SL_SI91X_FEAT_SLEEP_GPIO_SEL_BITMAP | SL_SI91X_ULP_GPIO9_FOR_UART2_TX
-						     | SL_SI91X_ENABLE_ENHANCED_MAX_PSP;
+		if (IS_ENABLED(CONFIG_WIFI_SILABS_SIWX91X_ENHANCED_MAX_PSP)) {
+			boot_config->config_feature_bit_map = SL_SI91X_FEAT_SLEEP_GPIO_SEL_BITMAP |
+				SL_SI91X_ULP_GPIO9_FOR_UART2_TX |
+				SL_SI91X_ENABLE_ENHANCED_MAX_PSP;
+		}
 	}
 #endif
 	
-#ifdef CONFIG_BT_SILABS_SIWX91X
-	// boot_config->feature_bit_map |=  SL_SI91X_FEAT_DEV_TO_HOST_ULP_GPIO_1;
-	boot_config->ext_custom_feature_bit_map |= SL_SI91X_EXT_FEAT_BT_CUSTOM_FEAT_ENABLE;
-	boot_config->bt_feature_bit_map |= SL_SI91X_BT_RF_TYPE | SL_SI91X_ENABLE_BLE_PROTOCOL;
-	boot_config->ble_feature_bit_map |=
-		SL_SI91X_BLE_MAX_NBR_ATT_REC(124) |
-		SL_SI91X_BLE_MAX_NBR_ATT_SERV(10) |
-		SL_SI91X_BLE_MAX_NBR_PERIPHERALS(8) |
-		SL_SI91X_BLE_PWR_INX(31) |
-		SL_SI91X_BLE_PWR_SAVE_OPTIONS(0) |
-		SL_SI91X_BLE_MAX_NBR_CENTRALS(2) |
-		SL_SI91X_BLE_GATT_ASYNC_ENABLE |
-		SL_SI91X_916_BLE_COMPATIBLE_FEAT_ENABLE |
-		SL_SI91X_FEAT_BLE_CUSTOM_FEAT_EXTENSION_VALID;
+	if (bt_enabled) {
+		boot_config->ext_custom_feature_bit_map |= SL_SI91X_EXT_FEAT_BT_CUSTOM_FEAT_ENABLE;
+		boot_config->bt_feature_bit_map |= SL_SI91X_BT_RF_TYPE | SL_SI91X_ENABLE_BLE_PROTOCOL;
 
-	boot_config->ble_ext_feature_bit_map |=
-		SL_SI91X_BLE_NUM_CONN_EVENTS(20) | SL_SI91X_BLE_ENABLE_ADV_EXTN |
-		SL_SI91X_BLE_GATT_INIT |
-		SL_SI91X_BT_BLE_STACK_BYPASS_ENABLE |
-		SL_SI91X_BLE_AE_MAX_ADV_SETS(2);
-#endif
+		if (ble_rf_test_only) {
+			/* Keep valid-but-minimal BLE ranges for RF test-only mode. */
+			boot_config->ble_feature_bit_map |=
+				SL_SI91X_BLE_MAX_NBR_ATT_REC(20) |
+				SL_SI91X_BLE_MAX_NBR_ATT_SERV(1) |
+				SL_SI91X_BLE_MAX_NBR_PERIPHERALS(1) |
+				SL_SI91X_BLE_PWR_INX(31) |
+				SL_SI91X_BLE_MAX_NBR_CENTRALS(1) |
+				SL_SI91X_FEAT_BLE_CUSTOM_FEAT_EXTENSION_VALID;
+			boot_config->ble_ext_feature_bit_map |=
+				SL_SI91X_BLE_NUM_CONN_EVENTS(1) |
+				SL_SI91X_BLE_NUM_REC_BYTES(64);
+		} else {
+			boot_config->ble_feature_bit_map |=
+				SL_SI91X_BLE_MAX_NBR_ATT_REC(124) |
+				SL_SI91X_BLE_MAX_NBR_ATT_SERV(10) |
+				SL_SI91X_BLE_MAX_NBR_PERIPHERALS(8) |
+				SL_SI91X_BLE_PWR_INX(31) |
+				SL_SI91X_BLE_PWR_SAVE_OPTIONS(0) |
+				SL_SI91X_BLE_MAX_NBR_CENTRALS(2) |
+				SL_SI91X_BLE_GATT_ASYNC_ENABLE |
+				SL_SI91X_916_BLE_COMPATIBLE_FEAT_ENABLE |
+				SL_SI91X_FEAT_BLE_CUSTOM_FEAT_EXTENSION_VALID;
+
+			boot_config->ble_ext_feature_bit_map |=
+				SL_SI91X_BLE_NUM_CONN_EVENTS(20) | SL_SI91X_BLE_ENABLE_ADV_EXTN |
+				SL_SI91X_BLE_GATT_INIT |
+				SL_SI91X_BLE_AE_MAX_ADV_SETS(2);
+		}
+	}
 }
 
 static void siwx91x_ncp_configure_ap_mode(sl_si91x_boot_configuration_t *boot_config,
@@ -980,28 +1538,12 @@ static int siwx91x_ncp_get_config(const struct device *dev,
 	 * equals SL_SI91X_EXT_FEAT_672K_M4SS_0K — all SRAM goes to the
 	 * NWP since the M4 is not executing user code.
 	 */
-	sl_wifi_device_configuration_t default_config = {
-		.boot_option = LOAD_NWP_FW,
-		.mac_address = NULL,
-		.band        = SL_WIFI_BAND_MODE_2_4GHZ,
-		.region_code = SL_WIFI_IGNORE_REGION,
-		.boot_config = {
-			.oper_mode              = SL_SI91X_TRANSMIT_TEST_MODE,
-			.feature_bit_map = SL_SI91X_FEAT_SECURITY_OPEN | SL_SI91X_FEAT_WPS_DISABLE |
-					   SL_SI91X_FEAT_SECURITY_PSK | SL_SI91X_FEAT_AGGREGATION |
-					   SL_SI91X_FEAT_HIDE_PSK_CREDENTIALS,
-			.tcp_ip_feature_bit_map = SL_SI91X_TCP_IP_FEAT_EXTENSION_VALID,
-			.custom_feature_bit_map = SL_SI91X_CUSTOM_FEAT_EXTENSION_VALID,
-			.ext_custom_feature_bit_map =
-				SL_SI91X_EXT_FEAT_XTAL_CLK | 
-				SL_SI91X_EXT_FEAT_DISABLE_XTAL_CORRECTION |
-				SL_SI91X_EXT_FEAT_UART_SEL_FOR_DEBUG_PRINTS |
-				SL_SI91X_EXT_FEAT_NWP_QSPI_80MHZ_CLK_ENABLE |
-				SL_SI91X_EXT_FEAT_672K_M4SS_0K |
-				SL_SI91X_EXT_FEAT_FRONT_END_INTERNAL_SWITCH |
-				SL_SI91X_EXT_FEAT_XTAL_CLK,
-		}
-	};
+	const bool ble_rf_test_only = IS_ENABLED(CONFIG_SIWX91X_NCP_BLE_RF_TEST) &&
+				      !IS_ENABLED(CONFIG_BT_SILABS_SIWX91X);
+	sl_wifi_device_configuration_t default_config = ble_rf_test_only ?
+		sl_wifi_default_client_configuration :
+		sl_wifi_default_transmit_test_configuration;
+	default_config.region_code = SL_WIFI_IGNORE_REGION;
 
 	sl_si91x_boot_configuration_t *boot_config = &default_config.boot_config;
 
@@ -1022,6 +1564,12 @@ static int siwx91x_ncp_get_config(const struct device *dev,
 		siwx91x_ncp_configure_sta_mode(boot_config);
 		LOG_INF("Configured STA mode, coex_mode=%d, bt_feature_bit_map=0x%x, ble_feature_bit_map=0x%x, ble_ext_feature_bit_map=0x%x",
 			boot_config->coex_mode, boot_config->bt_feature_bit_map, boot_config->ble_feature_bit_map, boot_config->ble_ext_feature_bit_map);
+		LOG_INF("STA boot cfg: oper=%u feat=0x%x tcp=0x%x cust=0x%x ext_cust=0x%x ext_tcp=0x%x cfg=0x%x",
+			boot_config->oper_mode, boot_config->feature_bit_map,
+			boot_config->tcp_ip_feature_bit_map, boot_config->custom_feature_bit_map,
+			boot_config->ext_custom_feature_bit_map,
+			boot_config->ext_tcp_ip_feature_bit_map,
+			boot_config->config_feature_bit_map);
 		break;
 	case WIFI_SOFTAP_MODE:
 		siwx91x_ncp_configure_ap_mode(boot_config, hidden_ssid, max_num_sta);
@@ -1048,7 +1596,7 @@ static int siwx91x_ncp_check_fw_version(void)
 		return -EINVAL;
 	}
 
-	LOG_WRN("NWP firmware %x%x.%u.%u.%u.%u.%u.%u (expected %X.%u.%u.%u.%u.%u.%u)",
+	LOG_ERR("NWP firmware %x%x.%u.%u.%u.%u.%u.%u (expected %X.%u.%u.%u.%u.%u.%u)",
 		version.chip_id, version.rom_id, version.major, version.minor,
 		version.security_version, version.patch_num, version.customer_id,
 		version.build_num,
@@ -1098,8 +1646,8 @@ int siwx91x_nwp_apply_power_profile(const struct device *dev,
 		return -EINVAL;
  	}
  
-#ifdef CONFIG_BT_SILABS_SIWX91X
-	{
+#if defined(CONFIG_BT_SILABS_SIWX91X) || defined(CONFIG_SIWX91X_NCP_BLE_RF_TEST)
+	if (IS_ENABLED(CONFIG_BT_SILABS_SIWX91X) || IS_ENABLED(CONFIG_SIWX91X_NCP_BLE_RF_TEST)) {
 		sl_bt_performance_profile_t bt_profile = { .profile = profile.profile };
 
 		ret = sl_si91x_bt_set_performance_profile(&bt_profile);
@@ -1199,11 +1747,13 @@ static int siwx91x_nwp_ncp_init(const struct device *dev)
 		LOG_ERR("Failed to set WiFi performance profile: 0x%x", ret);
 	}
 
-#ifdef CONFIG_BT_SILABS_SIWX91X
-	sl_bt_performance_profile_t bt_profile = { .profile = HIGH_PERFORMANCE };
-	ret = sl_si91x_bt_set_performance_profile(&bt_profile);
-	if (ret != SL_STATUS_OK) {
-		LOG_ERR("Failed to set BT performance profile: 0x%x", ret);
+#if defined(CONFIG_BT_SILABS_SIWX91X) || defined(CONFIG_SIWX91X_NCP_BLE_RF_TEST)
+	if (IS_ENABLED(CONFIG_BT_SILABS_SIWX91X) || IS_ENABLED(CONFIG_SIWX91X_NCP_BLE_RF_TEST)) {
+		sl_bt_performance_profile_t bt_profile = { .profile = HIGH_PERFORMANCE };
+		ret = sl_si91x_bt_set_performance_profile(&bt_profile);
+		if (ret != SL_STATUS_OK) {
+			LOG_ERR("Failed to set BT performance profile: 0x%x", ret);
+		}
 	}
 #endif
 
@@ -1218,6 +1768,12 @@ static int siwx91x_nwp_ncp_init(const struct device *dev)
 	LOG_INF("SiWx91x NCP NWP initialized successfully");
 	siwx91x_wifi_tx_test_set_defaults(&data->wifi_tx_test_cfg);
 	data->wifi_tx_test_running = false;
+#if defined(CONFIG_BT_SILABS_SIWX91X) || defined(CONFIG_SIWX91X_NCP_BLE_RF_TEST)
+	siwx91x_ble_per_tx_test_set_defaults(&data->ble_per_tx_cfg);
+	data->ble_per_tx_test_running = false;
+	data->ble_stack_initialized = false;
+	data->ble_radio_disabled = false;
+#endif
 
 	return 0;
 }
