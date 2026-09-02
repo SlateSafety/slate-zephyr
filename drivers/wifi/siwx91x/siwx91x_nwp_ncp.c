@@ -105,7 +105,6 @@ static int siwx91x_ncp_get_config(const struct device *dev,
 					uint8_t max_num_sta);
 static int siwx91x_ncp_check_fw_version(void);
 static int siwx91x_wifi_tx_test_stop_internal(const struct device *dev);
-static int siwx91x_ncp_power_cycle_module(void);
 #if defined(CONFIG_BT_SILABS_SIWX91X) || defined(CONFIG_SIWX91X_NCP_BLE_RF_TEST)
 static int siwx91x_ble_per_tx_test_stop_internal(const struct device *dev);
 #endif
@@ -210,37 +209,11 @@ static int siwx91x_ncp_runtime_init(const struct device *dev)
 	return 0;
 }
 
-static int siwx91x_ncp_power_cycle_module(void)
-{
-	if (!device_is_ready(gpiog_dev)) {
-		LOG_ERR("LOAD_SW GPIO device not ready");
-		return -ENODEV;
-	}
-
-	/* Power-cycle the module rail to guarantee a clean RF domain state. */
-	if (gpio_pin_set(gpiog_dev, LOAD_SW_PIN, 0) < 0) {
-		LOG_ERR("Failed to deassert LOAD_SW pin");
-		return -EIO;
-	}
-	k_msleep(60);
-
-	if (gpio_pin_set(gpiog_dev, LOAD_SW_PIN, 1) < 0) {
-		LOG_ERR("Failed to assert LOAD_SW pin");
-		return -EIO;
-	}
-	k_msleep(120);
-
-	LOG_INF("SiWx91x module power-cycled via LOAD_SW");
-	return 0;
-}
-
 static int siwx91x_ncp_reboot_and_reinit_for_mode(const struct device *dev, uint8_t target_mode)
 {
 	struct siwx91x_ncp_data *data = dev->data;
 	int ret;
 	int attempt;
-	const bool switching_modes = (data->active_test_mode != SIWX91X_TEST_MODE_NONE) &&
-					    (data->active_test_mode != target_mode);
 
 	if (data->nwp_initialized && data->active_test_mode == target_mode) {
 		return 0;
@@ -262,13 +235,6 @@ static int siwx91x_ncp_reboot_and_reinit_for_mode(const struct device *dev, uint
 		}
 	}
 
-	if (switching_modes) {
-		ret = siwx91x_ncp_power_cycle_module();
-		if (ret < 0) {
-			return ret;
-		}
-	}
-
 	for (attempt = 0; attempt < 2; attempt++) {
 		if (attempt == 1) {
 			/* Fallback recovery: force hardware reset if clean reinit failed. */
@@ -277,6 +243,18 @@ static int siwx91x_ncp_reboot_and_reinit_for_mode(const struct device *dev, uint
 			k_msleep(CONFIG_SIWX91X_NCP_RESET_HOLD_MS);
 			sl_si91x_host_release_from_reset();
 			k_msleep(CONFIG_SIWX91X_NCP_RESET_DELAY_MS);
+		}
+
+		/* Recreate host interface each attempt so boot config applies on clean host state. */
+		ret = sl_si91x_host_deinit();
+		if (ret != SL_STATUS_OK && ret != SL_STATUS_NOT_INITIALIZED) {
+			LOG_WRN("sl_si91x_host_deinit returned 0x%x", ret);
+		}
+
+		ret = sl_si91x_host_init(NULL);
+		if (ret != SL_STATUS_OK) {
+			LOG_ERR("sl_si91x_host_init failed during mode switch: 0x%x", ret);
+			return -EIO;
 		}
 
 		data->nwp_initialized = false;
@@ -1344,6 +1322,7 @@ sl_status_t sl_si91x_host_init(const sl_si91x_host_init_configuration_t *config)
 	}
 
 	data->bus_irq_enabled = false;
+	siwx91x_pm_lock_take();
 
 	LOG_INF("SiWx91x NCP SPI host initialized (freq: %u Hz)",
 		data->spi_cfg.frequency);
@@ -1363,6 +1342,15 @@ sl_status_t sl_si91x_host_deinit(void)
 	data->bus_irq_enabled = false;
 	gpio_pin_interrupt_configure_dt(&cfg->irq_gpio, GPIO_INT_DISABLE);
 	gpio_remove_callback(cfg->irq_gpio.port, &data->irq_cb_data);
+
+	if (device_is_ready(gpiog_dev)) {
+		(void)gpio_pin_set(gpiog_dev, LOAD_SW_PIN, 0);
+		k_msleep(60);
+		LOG_INF("SiWx91x module power disabled via LOAD_SW");
+	} else {
+		LOG_WRN("LOAD_SW GPIO device not ready during host deinit");
+	}
+
 	siwx91x_pm_lock_release();
 
 	LOG_INF("SiWx91x NCP SPI host deinitialized");
@@ -1745,7 +1733,8 @@ static void siwx91x_ncp_configure_network_stack(sl_si91x_boot_configuration_t *b
 
 static int siwx91x_ncp_get_config(const struct device *dev,
 				   sl_wifi_device_configuration_t *get_config,
-				   uint8_t wifi_oper_mode, bool hidden_ssid, uint8_t max_num_sta)
+				   uint8_t wifi_oper_mode, bool hidden_ssid,
+				   uint8_t max_num_sta)
 {
 	/*
 	 * Base configuration built from the SDK default
