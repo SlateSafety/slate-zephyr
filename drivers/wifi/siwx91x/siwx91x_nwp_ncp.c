@@ -76,6 +76,8 @@ struct siwx91x_ncp_data {
 	struct gpio_callback irq_cb_data;
 	struct spi_config spi_cfg;
 	volatile bool bus_irq_enabled;
+	bool nwp_initialized;
+	uint8_t active_test_mode;
 	sl_wifi_transmitter_test_info_t wifi_tx_test_cfg;
 	bool wifi_tx_test_running;
 #if defined(CONFIG_BT_SILABS_SIWX91X) || defined(CONFIG_SIWX91X_NCP_BLE_RF_TEST)
@@ -89,6 +91,24 @@ struct siwx91x_ncp_data {
 /* Singleton device pointer used by both host interface callbacks and shell CLI. */
 static const struct device *ncp_dev_instance;
 static bool siwx91x_pm_lock_held;
+static bool s_force_ble_rf_test_profile;
+
+enum siwx91x_test_mode {
+	SIWX91X_TEST_MODE_NONE = 0,
+	SIWX91X_TEST_MODE_WIFI,
+	SIWX91X_TEST_MODE_BLE,
+};
+
+static int siwx91x_ncp_get_config(const struct device *dev,
+					sl_wifi_device_configuration_t *get_config,
+					uint8_t wifi_oper_mode, bool hidden_ssid,
+					uint8_t max_num_sta);
+static int siwx91x_ncp_check_fw_version(void);
+static int siwx91x_wifi_tx_test_stop_internal(const struct device *dev);
+static int siwx91x_ncp_power_cycle_module(void);
+#if defined(CONFIG_BT_SILABS_SIWX91X) || defined(CONFIG_SIWX91X_NCP_BLE_RF_TEST)
+static int siwx91x_ble_per_tx_test_stop_internal(const struct device *dev);
+#endif
 
 static void siwx91x_pm_lock_take(void)
 {
@@ -132,6 +152,157 @@ static void siwx91x_wifi_tx_test_set_defaults(sl_wifi_transmitter_test_info_t *c
 	cfg->channel = 11;
 }
 
+static int siwx91x_ncp_runtime_init(const struct device *dev)
+{
+	struct siwx91x_ncp_data *data = dev->data;
+	sl_wifi_device_configuration_t network_config;
+	sl_mac_address_t mac_addr;
+	sl_wifi_performance_profile_v2_t wifi_profile = { .profile = HIGH_PERFORMANCE };
+	int ret;
+
+	if (data->nwp_initialized) {
+		return 0;
+	}
+
+	ret = siwx91x_ncp_get_config(dev, &network_config, WIFI_STA_MODE, false, 0);
+	if (ret < 0) {
+		LOG_ERR("Failed to get NWP config: %d", ret);
+		return ret;
+	}
+
+	ret = sl_wifi_init(&network_config, NULL, sl_wifi_default_event_handler);
+	if (ret != SL_STATUS_OK) {
+		LOG_ERR("sl_wifi_init failed: 0x%x", ret);
+		return -EIO;
+	}
+
+	ret = sl_wifi_get_mac_address(SL_WIFI_CLIENT_INTERFACE, &mac_addr);
+	if (ret == SL_STATUS_OK) {
+		LOG_INF("SiWx91x MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+			mac_addr.octet[0], mac_addr.octet[1], mac_addr.octet[2],
+			mac_addr.octet[3], mac_addr.octet[4], mac_addr.octet[5]);
+	} else {
+		LOG_WRN("Failed to read SiWx91x MAC address: 0x%x", ret);
+	}
+
+	ret = sl_wifi_set_performance_profile_v2(&wifi_profile);
+	if (ret != SL_STATUS_OK) {
+		LOG_ERR("Failed to set WiFi performance profile: 0x%x", ret);
+	}
+
+#if defined(CONFIG_BT_SILABS_SIWX91X) || defined(CONFIG_SIWX91X_NCP_BLE_RF_TEST)
+	if (IS_ENABLED(CONFIG_BT_SILABS_SIWX91X) || IS_ENABLED(CONFIG_SIWX91X_NCP_BLE_RF_TEST)) {
+		sl_bt_performance_profile_t bt_profile = { .profile = HIGH_PERFORMANCE };
+		ret = sl_si91x_bt_set_performance_profile(&bt_profile);
+		if (ret != SL_STATUS_OK) {
+			LOG_ERR("Failed to set BT performance profile: 0x%x", ret);
+		}
+	}
+#endif
+
+	ret = siwx91x_ncp_check_fw_version();
+	if (ret < 0) {
+		/* Version mismatch is treated as warning only. */
+	}
+
+	data->nwp_initialized = true;
+	LOG_INF("SiWx91x NCP NWP initialized successfully");
+	return 0;
+}
+
+static int siwx91x_ncp_power_cycle_module(void)
+{
+	if (!device_is_ready(gpiog_dev)) {
+		LOG_ERR("LOAD_SW GPIO device not ready");
+		return -ENODEV;
+	}
+
+	/* Power-cycle the module rail to guarantee a clean RF domain state. */
+	if (gpio_pin_set(gpiog_dev, LOAD_SW_PIN, 0) < 0) {
+		LOG_ERR("Failed to deassert LOAD_SW pin");
+		return -EIO;
+	}
+	k_msleep(60);
+
+	if (gpio_pin_set(gpiog_dev, LOAD_SW_PIN, 1) < 0) {
+		LOG_ERR("Failed to assert LOAD_SW pin");
+		return -EIO;
+	}
+	k_msleep(120);
+
+	LOG_INF("SiWx91x module power-cycled via LOAD_SW");
+	return 0;
+}
+
+static int siwx91x_ncp_reboot_and_reinit_for_mode(const struct device *dev, uint8_t target_mode)
+{
+	struct siwx91x_ncp_data *data = dev->data;
+	int ret;
+	int attempt;
+	const bool switching_modes = (data->active_test_mode != SIWX91X_TEST_MODE_NONE) &&
+					    (data->active_test_mode != target_mode);
+
+	if (data->nwp_initialized && data->active_test_mode == target_mode) {
+		return 0;
+	}
+
+	if (data->active_test_mode == SIWX91X_TEST_MODE_WIFI) {
+		(void)siwx91x_wifi_tx_test_stop_internal(dev);
+	}
+#if defined(CONFIG_BT_SILABS_SIWX91X) || defined(CONFIG_SIWX91X_NCP_BLE_RF_TEST)
+	if (data->active_test_mode == SIWX91X_TEST_MODE_BLE) {
+		(void)siwx91x_ble_per_tx_test_stop_internal(dev);
+	}
+#endif
+
+	if (data->nwp_initialized) {
+		ret = sl_wifi_deinit();
+		if (ret != SL_STATUS_OK) {
+			LOG_WRN("sl_wifi_deinit before mode switch returned 0x%x", ret);
+		}
+	}
+
+	if (switching_modes) {
+		ret = siwx91x_ncp_power_cycle_module();
+		if (ret < 0) {
+			return ret;
+		}
+	}
+
+	for (attempt = 0; attempt < 2; attempt++) {
+		if (attempt == 1) {
+			/* Fallback recovery: force hardware reset if clean reinit failed. */
+			LOG_WRN("Mode switch reinit failed; retrying with NCP hardware reset");
+			sl_si91x_host_hold_in_reset();
+			k_msleep(CONFIG_SIWX91X_NCP_RESET_HOLD_MS);
+			sl_si91x_host_release_from_reset();
+			k_msleep(CONFIG_SIWX91X_NCP_RESET_DELAY_MS);
+		}
+
+		data->nwp_initialized = false;
+		data->wifi_tx_test_running = false;
+#if defined(CONFIG_BT_SILABS_SIWX91X) || defined(CONFIG_SIWX91X_NCP_BLE_RF_TEST)
+		data->ble_per_tx_test_running = false;
+		data->ble_stack_initialized = false;
+		data->ble_radio_disabled = false;
+#endif
+
+		s_force_ble_rf_test_profile = (target_mode == SIWX91X_TEST_MODE_BLE);
+		ret = siwx91x_ncp_runtime_init(dev);
+		s_force_ble_rf_test_profile = false;
+		if (ret == 0) {
+			break;
+		}
+	}
+
+	if (ret < 0) {
+		return ret;
+	}
+
+	data->active_test_mode = target_mode;
+	return 0;
+}
+
 static int siwx91x_wifi_freq_mhz_to_channel(uint16_t freq_mhz, uint16_t *channel)
 {
 	if (freq_mhz < 2412 || freq_mhz > 2472) {
@@ -163,6 +334,12 @@ static int siwx91x_wifi_tx_test_start_internal(const struct device *dev)
 {
 	struct siwx91x_ncp_data *data = dev->data;
 	sl_status_t status;
+	int ret;
+
+	ret = siwx91x_ncp_reboot_and_reinit_for_mode(dev, SIWX91X_TEST_MODE_WIFI);
+	if (ret < 0) {
+		return ret;
+	}
 
 	if (!siwx91x_wifi_tx_length_is_valid(&data->wifi_tx_test_cfg)) {
 		LOG_ERR("Invalid length %u for mode %u", data->wifi_tx_test_cfg.length,
@@ -358,7 +535,13 @@ static int siwx91x_ble_per_tx_test_start_internal(const struct device *dev)
 	rsi_ble_per_transmit_t per_tx;
 	int32_t status;
 	sl_status_t sl_status;
+	int ret;
 	int attempt;
+
+	ret = siwx91x_ncp_reboot_and_reinit_for_mode(dev, SIWX91X_TEST_MODE_BLE);
+	if (ret < 0) {
+		return ret;
+	}
 
 	if (!data->ble_radio_disabled) {
 		/* Match WiseConnect BLE test examples: disable radio before BLE test commands. */
@@ -1401,9 +1584,11 @@ static void siwx91x_ncp_configure_sta_mode(sl_si91x_boot_configuration_t *boot_c
 {
 	const bool wifi_enabled = IS_ENABLED(CONFIG_WIFI_SILABS_SIWX91X);
 	const bool bt_enabled = IS_ENABLED(CONFIG_BT_SILABS_SIWX91X) ||
-				IS_ENABLED(CONFIG_SIWX91X_NCP_BLE_RF_TEST);
+				s_force_ble_rf_test_profile;
 	const bool ble_rf_test_only = IS_ENABLED(CONFIG_SIWX91X_NCP_BLE_RF_TEST) &&
-				      !IS_ENABLED(CONFIG_BT_SILABS_SIWX91X);
+				      !IS_ENABLED(CONFIG_BT_SILABS_SIWX91X) &&
+				      (!IS_ENABLED(CONFIG_WIFI_SILABS_SIWX91X) ||
+				       s_force_ble_rf_test_profile);
 
 	if (ble_rf_test_only) {
 		/* Keep BLE RF-test boot profile close to WiseConnect BLE examples. */
@@ -1454,11 +1639,11 @@ static void siwx91x_ncp_configure_sta_mode(sl_si91x_boot_configuration_t *boot_c
 		LOG_ERR("WiFi + Bluetooth coexistence is not fully supported in STA mode; using WLAN_BLE_MODE which has limited BT features");
 		boot_config->coex_mode = SL_SI91X_WLAN_BLE_MODE;
 	} else if (wifi_enabled) {
-		boot_config->coex_mode = SL_SI91X_WLAN_BLE_MODE;
+		boot_config->coex_mode = SL_SI91X_WLAN_ONLY_MODE;
 	} else if (bt_enabled) {
 		boot_config->coex_mode = SL_SI91X_WLAN_BLE_MODE;
 	} else {
-		boot_config->coex_mode = SL_SI91X_WLAN_BLE_MODE;
+		boot_config->coex_mode = SL_SI91X_WLAN_ONLY_MODE;
 	}
 
 #ifdef CONFIG_WIFI_SILABS_SIWX91X
@@ -1573,11 +1758,36 @@ static int siwx91x_ncp_get_config(const struct device *dev,
 	 * NWP since the M4 is not executing user code.
 	 */
 	const bool ble_rf_test_only = IS_ENABLED(CONFIG_SIWX91X_NCP_BLE_RF_TEST) &&
-				      !IS_ENABLED(CONFIG_BT_SILABS_SIWX91X);
-	sl_wifi_device_configuration_t default_config = ble_rf_test_only ?
-		sl_wifi_default_client_configuration :
-		sl_wifi_default_transmit_test_configuration;
-	default_config.region_code = SL_WIFI_IGNORE_REGION;
+				      !IS_ENABLED(CONFIG_BT_SILABS_SIWX91X) &&
+				      (!IS_ENABLED(CONFIG_WIFI_SILABS_SIWX91X) ||
+				       s_force_ble_rf_test_profile);
+	sl_wifi_device_configuration_t default_config = {
+		.boot_option = LOAD_NWP_FW,
+		.mac_address = NULL,
+		.band = SL_WIFI_BAND_MODE_2_4GHZ,
+		.region_code = SL_WIFI_IGNORE_REGION,
+		.boot_config = {
+			.oper_mode = SL_SI91X_TRANSMIT_TEST_MODE,
+			.feature_bit_map = SL_SI91X_FEAT_SECURITY_OPEN | SL_SI91X_FEAT_WPS_DISABLE |
+						   SL_SI91X_FEAT_SECURITY_PSK | SL_SI91X_FEAT_AGGREGATION |
+						   SL_SI91X_FEAT_HIDE_PSK_CREDENTIALS,
+			.tcp_ip_feature_bit_map = SL_SI91X_TCP_IP_FEAT_EXTENSION_VALID,
+			.custom_feature_bit_map = SL_SI91X_CUSTOM_FEAT_EXTENSION_VALID,
+			.ext_custom_feature_bit_map =
+				SL_SI91X_EXT_FEAT_XTAL_CLK |
+				SL_SI91X_EXT_FEAT_DISABLE_XTAL_CORRECTION |
+				SL_SI91X_EXT_FEAT_UART_SEL_FOR_DEBUG_PRINTS |
+				SL_SI91X_EXT_FEAT_NWP_QSPI_80MHZ_CLK_ENABLE |
+				SL_SI91X_EXT_FEAT_672K_M4SS_0K |
+				SL_SI91X_EXT_FEAT_FRONT_END_INTERNAL_SWITCH |
+				SL_SI91X_EXT_FEAT_XTAL_CLK,
+		}
+	};
+
+	if (ble_rf_test_only) {
+		default_config = sl_wifi_default_client_configuration;
+		default_config.region_code = SL_WIFI_IGNORE_REGION;
+	}
 
 	sl_si91x_boot_configuration_t *boot_config = &default_config.boot_config;
 
@@ -1701,6 +1911,7 @@ int siwx91x_nwp_apply_power_profile(const struct device *dev,
 int siwx91x_nwp_mode_switch(const struct device *dev, uint8_t oper_mode, bool hidden_ssid,
 			    uint8_t max_num_sta)
 {
+	struct siwx91x_ncp_data *data = dev->data;
 	sl_wifi_device_configuration_t nwp_config;
 	int status;
 
@@ -1709,15 +1920,19 @@ int siwx91x_nwp_mode_switch(const struct device *dev, uint8_t oper_mode, bool hi
 		return status;
 	}
 
-	status = sl_wifi_deinit();
-	if (status != SL_STATUS_OK) {
-		return -ETIMEDOUT;
+	if (data->nwp_initialized) {
+		status = sl_wifi_deinit();
+		if (status != SL_STATUS_OK) {
+			return -ETIMEDOUT;
+		}
 	}
 
 	status = sl_wifi_init(&nwp_config, NULL, sl_wifi_default_event_handler);
 	if (status != SL_STATUS_OK) {
 		return -ETIMEDOUT;
 	}
+
+	data->nwp_initialized = true;
 
 	return 0;
 }
@@ -1729,8 +1944,6 @@ int siwx91x_nwp_mode_switch(const struct device *dev, uint8_t oper_mode, bool hi
 static int siwx91x_nwp_ncp_init(const struct device *dev)
 {
 	struct siwx91x_ncp_data *data = dev->data;
-	sl_wifi_device_configuration_t network_config;
-	int ret;
 
 	/* Store singleton reference for sl_si91x_host_*() callbacks */
 	ncp_dev_instance = dev;
@@ -1743,64 +1956,8 @@ static int siwx91x_nwp_ncp_init(const struct device *dev)
 	data->spi_cfg.frequency = CONFIG_SIWX91X_NCP_SPI_FREQUENCY;
 	data->spi_cfg.operation = SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | SPI_TRANSFER_MSB;
 
-	/* Get NWP boot configuration */
-	ret = siwx91x_ncp_get_config(dev, &network_config, WIFI_STA_MODE, false, 0);
-	if (ret < 0) {
-		LOG_ERR("Failed to get NWP config: %d", ret);
-		return ret;
-	}
-
-	/* Boot the NWP via sl_wifi_init — this triggers the SPI handshake,
-	 * firmware load/verify, and NWP initialization sequence through the
-	 * WiseConnect SDK.
-	 */
-	ret = sl_wifi_init(&network_config, NULL, sl_wifi_default_event_handler);
-	if (ret != SL_STATUS_OK) {
-		LOG_ERR("sl_wifi_init failed: 0x%x", ret);
-		return -EINVAL;
-	}
-
-	sl_mac_address_t mac_addr;
-
-	ret = sl_wifi_get_mac_address(SL_WIFI_CLIENT_INTERFACE, &mac_addr);
-	if (ret == SL_STATUS_OK) {
-		LOG_INF("SiWx91x MAC: %02x:%02x:%02x:%02x:%02x:%02x",
-			mac_addr.octet[0], mac_addr.octet[1], mac_addr.octet[2],
-			mac_addr.octet[3], mac_addr.octet[4], mac_addr.octet[5]);
-	} else {
-		LOG_WRN("Failed to read SiWx91x MAC address: 0x%x", ret);
-	}
-
-	/* Use HIGH_PERFORMANCE until sleep/wake GPIO handshaking is implemented.
-	 * ASSOCIATED_POWER_SAVE requires the sleep-request and wake-indicator GPIOs
-	 * to be functional — without them the NWP may sleep and never wake for SPI
-	 * transactions, causing command timeouts (especially BLE).
-	 */
-	sl_wifi_performance_profile_v2_t wifi_profile = { .profile = HIGH_PERFORMANCE };
-	ret = sl_wifi_set_performance_profile_v2(&wifi_profile);
-	if (ret != SL_STATUS_OK) {
-		LOG_ERR("Failed to set WiFi performance profile: 0x%x", ret);
-	}
-
-#if defined(CONFIG_BT_SILABS_SIWX91X) || defined(CONFIG_SIWX91X_NCP_BLE_RF_TEST)
-	if (IS_ENABLED(CONFIG_BT_SILABS_SIWX91X) || IS_ENABLED(CONFIG_SIWX91X_NCP_BLE_RF_TEST)) {
-		sl_bt_performance_profile_t bt_profile = { .profile = HIGH_PERFORMANCE };
-		ret = sl_si91x_bt_set_performance_profile(&bt_profile);
-		if (ret != SL_STATUS_OK) {
-			LOG_ERR("Failed to set BT performance profile: 0x%x", ret);
-		}
-	}
-#endif
-
-	/* Check firmware version */
-	ret = siwx91x_ncp_check_fw_version();
-	if (ret < 0) {
-		//LOG_ERR("Unexpected NWP firmware version (expected: %s)",
-			//SIWX91X_NWP_FW_EXPECTED_VERSION);
-		/* Continue — version mismatch is a warning, not fatal */
-	}
-
-	LOG_INF("SiWx91x NCP NWP initialized successfully");
+	data->nwp_initialized = false;
+	data->active_test_mode = SIWX91X_TEST_MODE_NONE;
 	siwx91x_wifi_tx_test_set_defaults(&data->wifi_tx_test_cfg);
 	data->wifi_tx_test_running = false;
 #if defined(CONFIG_BT_SILABS_SIWX91X) || defined(CONFIG_SIWX91X_NCP_BLE_RF_TEST)
@@ -1809,6 +1966,8 @@ static int siwx91x_nwp_ncp_init(const struct device *dev)
 	data->ble_stack_initialized = false;
 	data->ble_radio_disabled = false;
 #endif
+
+	LOG_INF("SiWx91x NCP device ready (runtime init deferred until first command)");
 
 	return 0;
 }
