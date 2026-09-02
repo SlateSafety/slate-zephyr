@@ -91,7 +91,6 @@ struct siwx91x_ncp_data {
 /* Singleton device pointer used by both host interface callbacks and shell CLI. */
 static const struct device *ncp_dev_instance;
 static bool siwx91x_pm_lock_held;
-static bool s_force_ble_rf_test_profile;
 
 enum siwx91x_test_mode {
 	SIWX91X_TEST_MODE_NONE = 0,
@@ -102,7 +101,8 @@ enum siwx91x_test_mode {
 static int siwx91x_ncp_get_config(const struct device *dev,
 					sl_wifi_device_configuration_t *get_config,
 					uint8_t wifi_oper_mode, bool hidden_ssid,
-					uint8_t max_num_sta);
+					uint8_t max_num_sta,
+					bool force_ble_rf_test_profile);
 static int siwx91x_ncp_check_fw_version(void);
 static int siwx91x_wifi_tx_test_stop_internal(const struct device *dev);
 #if defined(CONFIG_BT_SILABS_SIWX91X) || defined(CONFIG_SIWX91X_NCP_BLE_RF_TEST)
@@ -151,23 +151,28 @@ static void siwx91x_wifi_tx_test_set_defaults(sl_wifi_transmitter_test_info_t *c
 	cfg->channel = 11;
 }
 
-static int siwx91x_ncp_runtime_init(const struct device *dev)
+static int siwx91x_ncp_runtime_init(const struct device *dev, uint8_t target_mode)
 {
 	struct siwx91x_ncp_data *data = dev->data;
 	sl_wifi_device_configuration_t network_config;
 	sl_mac_address_t mac_addr;
 	sl_wifi_performance_profile_v2_t wifi_profile = { .profile = HIGH_PERFORMANCE };
+	const bool force_ble_rf_test_profile = (target_mode == SIWX91X_TEST_MODE_BLE);
 	int ret;
 
 	if (data->nwp_initialized) {
 		return 0;
 	}
 
-	ret = siwx91x_ncp_get_config(dev, &network_config, WIFI_STA_MODE, false, 0);
+	ret = siwx91x_ncp_get_config(dev, &network_config, WIFI_STA_MODE, false, 0,
+					 force_ble_rf_test_profile);
 	if (ret < 0) {
 		LOG_ERR("Failed to get NWP config: %d", ret);
 		return ret;
 	}
+
+	LOG_INF("Runtime init selected %s profile",
+		force_ble_rf_test_profile ? "BLE RF" : "WiFi TX");
 
 	ret = sl_wifi_init(&network_config, NULL, sl_wifi_default_event_handler);
 	if (ret != SL_STATUS_OK) {
@@ -265,9 +270,7 @@ static int siwx91x_ncp_reboot_and_reinit_for_mode(const struct device *dev, uint
 		data->ble_radio_disabled = false;
 #endif
 
-		s_force_ble_rf_test_profile = (target_mode == SIWX91X_TEST_MODE_BLE);
-		ret = siwx91x_ncp_runtime_init(dev);
-		s_force_ble_rf_test_profile = false;
+		ret = siwx91x_ncp_runtime_init(dev, target_mode);
 		if (ret == 0) {
 			break;
 		}
@@ -1568,15 +1571,16 @@ bool sl_si91x_host_is_in_irq_context(void)
 
 #define AP_MAX_NUM_STA 4
 #define MEMORY_CONFIG (BIT(20) | BIT(21))
-static void siwx91x_ncp_configure_sta_mode(sl_si91x_boot_configuration_t *boot_config)
+static void siwx91x_ncp_configure_sta_mode(sl_si91x_boot_configuration_t *boot_config,
+						    bool force_ble_rf_test_profile)
 {
 	const bool wifi_enabled = IS_ENABLED(CONFIG_WIFI_SILABS_SIWX91X);
 	const bool bt_enabled = IS_ENABLED(CONFIG_BT_SILABS_SIWX91X) ||
-				s_force_ble_rf_test_profile;
+				force_ble_rf_test_profile;
 	const bool ble_rf_test_only = IS_ENABLED(CONFIG_SIWX91X_NCP_BLE_RF_TEST) &&
 				      !IS_ENABLED(CONFIG_BT_SILABS_SIWX91X) &&
 				      (!IS_ENABLED(CONFIG_WIFI_SILABS_SIWX91X) ||
-				       s_force_ble_rf_test_profile);
+				       force_ble_rf_test_profile);
 
 	if (ble_rf_test_only) {
 		/* Keep BLE RF-test boot profile close to WiseConnect BLE examples. */
@@ -1734,7 +1738,7 @@ static void siwx91x_ncp_configure_network_stack(sl_si91x_boot_configuration_t *b
 static int siwx91x_ncp_get_config(const struct device *dev,
 				   sl_wifi_device_configuration_t *get_config,
 				   uint8_t wifi_oper_mode, bool hidden_ssid,
-				   uint8_t max_num_sta)
+				   uint8_t max_num_sta, bool force_ble_rf_test_profile)
 {
 	/*
 	 * Base configuration built from the SDK default
@@ -1749,7 +1753,7 @@ static int siwx91x_ncp_get_config(const struct device *dev,
 	const bool ble_rf_test_only = IS_ENABLED(CONFIG_SIWX91X_NCP_BLE_RF_TEST) &&
 				      !IS_ENABLED(CONFIG_BT_SILABS_SIWX91X) &&
 				      (!IS_ENABLED(CONFIG_WIFI_SILABS_SIWX91X) ||
-				       s_force_ble_rf_test_profile);
+				       force_ble_rf_test_profile);
 	sl_wifi_device_configuration_t default_config = {
 		.boot_option = LOAD_NWP_FW,
 		.mac_address = NULL,
@@ -1794,7 +1798,7 @@ static int siwx91x_ncp_get_config(const struct device *dev,
 
 	switch (wifi_oper_mode) {
 	case WIFI_STA_MODE:
-		siwx91x_ncp_configure_sta_mode(boot_config);
+		siwx91x_ncp_configure_sta_mode(boot_config, force_ble_rf_test_profile);
 		LOG_INF("Configured STA mode, coex_mode=%d, bt_feature_bit_map=0x%x, ble_feature_bit_map=0x%x, ble_ext_feature_bit_map=0x%x",
 			boot_config->coex_mode, boot_config->bt_feature_bit_map, boot_config->ble_feature_bit_map, boot_config->ble_ext_feature_bit_map);
 		LOG_INF("STA boot cfg: oper=%u feat=0x%x tcp=0x%x cust=0x%x ext_cust=0x%x ext_tcp=0x%x cfg=0x%x",
@@ -1904,7 +1908,8 @@ int siwx91x_nwp_mode_switch(const struct device *dev, uint8_t oper_mode, bool hi
 	sl_wifi_device_configuration_t nwp_config;
 	int status;
 
-	status = siwx91x_ncp_get_config(dev, &nwp_config, oper_mode, hidden_ssid, max_num_sta);
+	status = siwx91x_ncp_get_config(dev, &nwp_config, oper_mode, hidden_ssid, max_num_sta,
+					false);
 	if (status < 0) {
 		return status;
 	}
