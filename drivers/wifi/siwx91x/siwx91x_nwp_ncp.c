@@ -1407,7 +1407,7 @@ static void siwx91x_ncp_configure_sta_mode(sl_si91x_boot_configuration_t *boot_c
 
 	if (ble_rf_test_only) {
 		/* Keep BLE RF-test boot profile close to WiseConnect BLE examples. */
-		boot_config->oper_mode = SL_SI91X_CLIENT_MODE;
+		boot_config->oper_mode = SL_SI91X_TRANSMIT_TEST_MODE;
 		boot_config->coex_mode = SL_SI91X_WLAN_BLE_MODE;
 		boot_config->feature_bit_map = SL_SI91X_FEAT_WPS_DISABLE |
 			SL_SI91X_FEAT_ULP_GPIO_BASED_HANDSHAKE |
@@ -1439,7 +1439,7 @@ static void siwx91x_ncp_configure_sta_mode(sl_si91x_boot_configuration_t *boot_c
 		return;
 	}
 
-	boot_config->oper_mode = ble_rf_test_only ? SL_SI91X_CLIENT_MODE :
+	boot_config->oper_mode = ble_rf_test_only ? SL_SI91X_TRANSMIT_TEST_MODE :
 				      SL_SI91X_TRANSMIT_TEST_MODE;
 
 	if (IS_ENABLED(CONFIG_WIFI_SILABS_SIWX91X_ROAMING_USE_DEAUTH)) {
@@ -1577,7 +1577,7 @@ static int siwx91x_ncp_get_config(const struct device *dev,
 	sl_wifi_device_configuration_t default_config = ble_rf_test_only ?
 		sl_wifi_default_client_configuration :
 		sl_wifi_default_transmit_test_configuration;
-	default_config.region_code = SL_WIFI_IGNORE_REGION;
+	default_config.region_code = SL_WIFI_REGION_US;
 
 	sl_si91x_boot_configuration_t *boot_config = &default_config.boot_config;
 
