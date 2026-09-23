@@ -68,6 +68,10 @@ unsigned int siwx91x_on_scan(sl_wifi_event_t event, unsigned int status,
 	sl_wifi_scan_result_t *result = data;
 	struct siwx91x_dev *sidev = arg;
 	int i, scan_count;
+	
+	if (result == NULL) {
+	 	return -EINVAL;
+	}
 
 	if (!sidev->scan_res_cb) {
 		return -EFAULT;

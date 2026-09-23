@@ -10,7 +10,7 @@
 #define DT_DRV_COMPAT silabs_siwx91x_bt_hci
 #define LOG_LEVEL     CONFIG_BT_HCI_DRIVER_LOG_LEVEL
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(bt_hci_driver_siwg917, 4);
+LOG_MODULE_REGISTER(bt_hci_driver_siwg917, 1);
 
 #include "rsi_ble.h"
 #include "rsi_ble_common_config.h"
