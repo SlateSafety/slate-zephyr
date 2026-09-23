@@ -543,7 +543,7 @@ static void siwx91x_ncp_configure_sta_mode(sl_si91x_boot_configuration_t *boot_c
 		LOG_ERR("WiFi + Bluetooth coexistence is not fully supported in STA mode; using WLAN_BLE_MODE which has limited BT features");
 		boot_config->coex_mode = SL_SI91X_WLAN_BLE_MODE;
 	} else if (wifi_enabled) {
-		boot_config->coex_mode = SL_SI91X_WLAN_ONLY_MODE;
+		boot_config->coex_mode = SL_SI91X_WLAN_BLE_MODE;
 	} else if (bt_enabled) {
 		boot_config->coex_mode = SL_SI91X_WLAN_BLE_MODE;
 	} else {
@@ -748,7 +748,7 @@ int siwx91x_nwp_apply_power_profile(const struct device *dev,
 	ARG_UNUSED(dev);
 
 	if (wifi_profile != NULL) {
-		profile = *wifi_profile;
+		memcpy(&profile, wifi_profile, sizeof(profile));
 	}
 
 	ret = sl_wifi_set_performance_profile_v2(&profile);
@@ -864,7 +864,6 @@ static int siwx91x_nwp_ncp_init(const struct device *dev)
 		LOG_ERR("Failed to set BT performance profile: 0x%x", ret);
 	}
 #endif
-
 	/* Check firmware version */
 	ret = siwx91x_ncp_check_fw_version();
 	if (ret < 0) {
@@ -875,6 +874,19 @@ static int siwx91x_nwp_ncp_init(const struct device *dev)
 
 	LOG_INF("SiWx91x NCP NWP initialized successfully");
 	return 0;
+}
+
+static int siwx91x_nwp_ncp_deinit(const struct device *dev)
+{
+	int ret = sl_wifi_deinit();
+	if (ret) {
+	  LOG_ERR("Couldn't deinit sl wifi %d", ret);
+	  return ret;
+	}
+	
+	gpio_pin_set(gpiog_dev, LOAD_SW_PIN, 0);
+	k_msleep(100);
+	return ret;
 }
 
 /* ========================================================================== */
@@ -897,7 +909,7 @@ static int siwx91x_nwp_ncp_init(const struct device *dev)
 			(.wake_gpio = GPIO_DT_SPEC_INST_GET(inst, wake_indicator_gpios),))     \
 	};                                                                                     \
                                                                                                \
-	DEVICE_DT_INST_DEFINE(inst, &siwx91x_nwp_ncp_init, NULL,                               \
+	DEVICE_DT_INST_DEINIT_DEFINE(inst, &siwx91x_nwp_ncp_init, &siwx91x_nwp_ncp_deinit, NULL,     \
 			      &siwx91x_ncp_data_##inst, &siwx91x_ncp_config_##inst,            \
 			      POST_KERNEL, CONFIG_SIWX91X_NCP_SPI_INIT_PRIORITY, NULL);
 

@@ -33,7 +33,10 @@ static int siwx91x_get_connected_ap_beacon_interval_ms(void)
 
 	ret = sl_wifi_get_operational_statistics(SL_WIFI_CLIENT_INTERFACE, &sl_stat);
 	if (ret) {
+		LOG_ERR("No op stats err %d", ret);
 		return 0;
+	} else {
+		LOG_DBG("beacon_interval %d", sl_stat.beacon_interval);
 	}
 
 	return sys_get_le16(sl_stat.beacon_interval) * 1024 / 1000;
@@ -81,7 +84,7 @@ int siwx91x_apply_power_save(struct siwx91x_dev *sidev)
 
 	if (sidev->ps_params.wakeup_mode == WIFI_PS_WAKEUP_MODE_LISTEN_INTERVAL &&
 	    !sidev->ps_params.listen_interval) {
-		LOG_INF("Disabling listen interval based wakeup until connection establishes");
+		LOG_INF("Disabling listen interval based wakeup until connection establishes %u", sidev->ps_params.listen_interval);
 	}
 	if (sidev->ps_params.wakeup_mode == WIFI_PS_WAKEUP_MODE_DTIM ||
 	    !sidev->ps_params.listen_interval) {
