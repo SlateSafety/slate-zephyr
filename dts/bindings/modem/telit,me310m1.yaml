@@ -8,6 +8,8 @@ compatible: "telit,me310m1"
 include: zephyr,cellular-modem-device.yaml
 
 properties:
+  mdm-dtr-gpios:
+    type: phandle-array
   mdm-power-gpios:
     type: phandle-array
     required: true
