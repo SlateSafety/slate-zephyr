@@ -159,8 +159,6 @@ struct modem_cellular_config {
 	struct modem_cellular_user_pipe *user_pipes;
 	uint8_t user_pipes_size;
 };
->>>>>>> 3723c9a5c7e (Add Telit ME310M1 to supported cellular modems)
-
 static const char *modem_cellular_state_str(enum modem_cellular_state state)
 {
 	switch (state) {
@@ -3801,4 +3799,3 @@ DT_INST_FOREACH_STATUS_OKAY(MODEM_CELLULAR_DEVICE_NORDIC_NRF91_SLM)
 #define DT_DRV_COMPAT sqn_gm02s
 DT_INST_FOREACH_STATUS_OKAY(MODEM_CELLULAR_DEVICE_SQN_GM02S)
 #undef DT_DRV_COMPAT
->>>>>>> 3723c9a5c7e (Add Telit ME310M1 to supported cellular modems)
