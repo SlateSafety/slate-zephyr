@@ -97,10 +97,11 @@ unsigned int siwx91x_wifi_module_stats_event_handler(sl_wifi_event_t event, unsi
 		if (IS_ENABLED(CONFIG_WIFI_SILABS_SIWX91X_NET_STACK_NATIVE)) {
 			net_if_dormant_on(sidev->iface);
 		}
+		/* A scan completion must not resurrect the old association. */
+		sidev->scan_prev_state = WIFI_STATE_DISCONNECTED;
+		sidev->state = WIFI_STATE_DISCONNECTED;
 		wifi_mgmt_raise_disconnect_result_event(sidev->iface,
 							WIFI_REASON_DISCONN_SUCCESS);
-
-		sidev->state = WIFI_STATE_DISCONNECTED;
 		break;
 	default:
 		return 0;
@@ -163,9 +164,15 @@ int siwx91x_disconnect(const struct device *dev, struct net_if *iface)
 		return -EIO;
 	}
 
+	/* The synchronous command succeeded; module-state notifications are not
+	 * guaranteed for a locally requested disconnect. Publish state first.
+	 */
+	sidev->state = WIFI_STATE_DISCONNECTED;
+	sidev->scan_prev_state = WIFI_STATE_DISCONNECTED;
 	if (IS_ENABLED(CONFIG_WIFI_SILABS_SIWX91X_NET_STACK_NATIVE)) {
 		net_if_dormant_on(iface);
 	}
+	wifi_mgmt_raise_disconnect_result_event(iface, WIFI_REASON_DISCONN_SUCCESS);
 
 	return 0;
 }

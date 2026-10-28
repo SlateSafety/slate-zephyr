@@ -2319,10 +2319,6 @@ static int dns_server_close(struct dns_resolve_context *ctx,
 	ctx->servers[server_idx].sock = -1;
 	ctx->servers[server_idx].dns_server.sa_family = 0;
 
-	ARRAY_FOR_EACH(ctx->fds, j) {
-		ctx->fds[j].fd = -1;
-	}
-
 	return 0;
 }
 
@@ -2378,9 +2374,12 @@ int dns_resolve_close(struct dns_resolve_context *ctx)
 }
 
 static bool dns_server_exists(struct dns_resolve_context *ctx,
-			      const struct net_sockaddr *addr)
+			      const struct net_sockaddr *addr, int if_index)
 {
 	for (int i = 0; i < SERVER_COUNT; i++) {
+		if (ctx->servers[i].sock < 0 || ctx->servers[i].if_index != if_index) {
+			continue;
+		}
 		if (IS_ENABLED(CONFIG_NET_IPV4) && (addr->sa_family == NET_AF_INET) &&
 		    (ctx->servers[i].dns_server.sa_family == NET_AF_INET)) {
 			if (net_ipv4_addr_cmp(&net_sin(addr)->sin_addr,
@@ -2403,7 +2402,7 @@ static bool dns_server_exists(struct dns_resolve_context *ctx,
 
 static bool dns_servers_exists(struct dns_resolve_context *ctx,
 			       const char *servers[],
-			       const struct net_sockaddr *servers_sa[])
+			       const struct net_sockaddr *servers_sa[], int interfaces[])
 {
 	if (servers) {
 		for (int i = 0; i < SERVER_COUNT && servers[i]; i++) {
@@ -2413,7 +2412,7 @@ static bool dns_servers_exists(struct dns_resolve_context *ctx,
 				continue;
 			}
 
-			if (!dns_server_exists(ctx, &addr)) {
+			if (!dns_server_exists(ctx, &addr, 0)) {
 				return false;
 			}
 		}
@@ -2421,7 +2420,8 @@ static bool dns_servers_exists(struct dns_resolve_context *ctx,
 
 	if (servers_sa) {
 		for (int i = 0; i < SERVER_COUNT && servers_sa[i]; i++) {
-			if (!dns_server_exists(ctx, servers_sa[i])) {
+			if (!dns_server_exists(ctx, servers_sa[i],
+					       interfaces ? interfaces[i] : 0)) {
 				return false;
 			}
 		}
@@ -2446,7 +2446,7 @@ static int do_dns_resolve_reconfigure(struct dns_resolve_context *ctx,
 	k_mutex_lock(&lock, K_FOREVER);
 	k_mutex_lock(&ctx->lock, K_FOREVER);
 
-	if (dns_servers_exists(ctx, servers, servers_sa)) {
+	if (dns_servers_exists(ctx, servers, servers_sa, interfaces)) {
 		/* DNS servers did not change. */
 		err = 0;
 		goto unlock;

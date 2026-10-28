@@ -68,17 +68,22 @@ unsigned int siwx91x_on_scan(sl_wifi_event_t event, unsigned int status,
 	sl_wifi_scan_result_t *result = data;
 	struct siwx91x_dev *sidev = arg;
 	int i, scan_count;
-	
-	if (result == NULL) {
-	 	return -EINVAL;
+	scan_result_cb_t cb = sidev->scan_res_cb;
+
+	if (!cb) {
+		return 0; /* Late/duplicate completion, no outstanding request. */
 	}
 
-	if (!sidev->scan_res_cb) {
-		return -EFAULT;
+	/* Restore state before publishing completion: consumers may immediately
+	 * request a join or another scan. Even failures with no payload finish.
+	 */
+	if (sidev->state == WIFI_STATE_SCANNING) {
+		sidev->state = sidev->scan_prev_state;
 	}
-
-	if (event & SL_WIFI_EVENT_FAIL_INDICATION) {
-		memset(result, 0, sizeof(*result));
+	if (result == NULL || (event & SL_WIFI_EVENT_FAIL_INDICATION)) {
+		sidev->scan_res_cb = NULL;
+		cb(sidev->iface, -EIO, NULL);
+		return 0;
 	}
 
 	if (sidev->scan_max_bss_cnt) {
@@ -91,8 +96,8 @@ unsigned int siwx91x_on_scan(sl_wifi_event_t event, unsigned int status,
 		siwx91x_report_scan_res(sidev, result, i);
 	}
 
-	sidev->scan_res_cb(sidev->iface, 0, NULL);
-	sidev->state = sidev->scan_prev_state;
+	sidev->scan_res_cb = NULL;
+	cb(sidev->iface, 0, NULL);
 
 	return 0;
 }
@@ -250,13 +255,18 @@ int siwx91x_scan(const struct device *dev,
 
 	sidev->scan_max_bss_cnt = z_scan_config->max_bss_cnt;
 	sidev->scan_res_cb = cb;
+	/* Arm state before the async command: completion can race its return. */
+	sidev->scan_prev_state = sidev->state;
+	sidev->state = WIFI_STATE_SCANNING;
 	ret = sl_wifi_start_scan(SL_WIFI_CLIENT_2_4GHZ_INTERFACE, (ssid.length > 0) ? &ssid : NULL,
 				 &sl_scan_config);
 	if (ret != SL_STATUS_IN_PROGRESS) {
+		if (sidev->state == WIFI_STATE_SCANNING) {
+			sidev->state = sidev->scan_prev_state;
+		}
+		sidev->scan_res_cb = NULL;
 		return -EIO;
 	}
-	sidev->scan_prev_state = sidev->state;
-	sidev->state = WIFI_STATE_SCANNING;
 
 	return 0;
 }

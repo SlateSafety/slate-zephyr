@@ -58,7 +58,7 @@ int siwx91x_status(const struct device *dev,
 	memset(status, 0, sizeof(*status));
 
 	status->state = sidev->state;
-	if (sidev->state <= WIFI_STATE_INACTIVE) {
+	if (sidev->state != WIFI_STATE_COMPLETED) {
 		return 0;
 	}
 

@@ -331,33 +331,51 @@ out:
 
 int dns_dispatcher_unregister(struct dns_socket_dispatcher *ctx)
 {
+	struct dns_socket_dispatcher *entry, *survivor = NULL;
 	int ret = 0;
+	int closing_sock = ctx->sock;
 
 	k_mutex_lock(&lock, K_FOREVER);
-
 	(void)sys_slist_find_and_remove(&sockets, &ctx->node);
 
-	(void)net_socket_service_unregister(ctx->svc);
-
-	/* Mark the context as unregistered */
-	ctx->sock = -1;
+	/* Resolver servers share one poll array/service. Removing an interface
+	 * must not stop receiving replies for every other interface as well.
+	 */
+	SYS_SLIST_FOR_EACH_CONTAINER(&sockets, entry, node) {
+		if (entry->svc == ctx->svc && entry->fds == ctx->fds && entry->sock >= 0) {
+			survivor = entry;
+			break;
+		}
+	}
 
 	for (int i = 0; i < ctx->fds_len; i++) {
-		CHECKIF((int)ctx->fds[i].fd >= (int)ARRAY_SIZE(dispatch_table)) {
+		int fd = ctx->fds[i].fd;
+
+		CHECKIF(fd >= (int)ARRAY_SIZE(dispatch_table)) {
 			ret = -ERANGE;
 			goto out;
 		}
-
-		if (ctx->fds[i].fd < 0) {
+		if (fd < 0) {
 			continue;
 		}
+		if (fd == closing_sock || survivor == NULL) {
+			dispatch_table[fd].ctx = NULL;
+			ctx->fds[i].fd = -1;
+		} else if (dispatch_table[fd].ctx == ctx) {
+			dispatch_table[fd].ctx = survivor;
+		}
+	}
 
-		dispatch_table[ctx->fds[i].fd].ctx = NULL;
+	ctx->sock = -1;
+	if (survivor != NULL) {
+		ret = net_socket_service_register(ctx->svc, ctx->fds, ctx->fds_len,
+						 &dispatch_table);
+	} else {
+		ret = net_socket_service_unregister(ctx->svc);
 	}
 
 out:
 	k_mutex_unlock(&lock);
-
 	return ret;
 }
 

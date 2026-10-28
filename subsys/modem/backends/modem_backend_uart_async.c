@@ -164,10 +164,6 @@ static int modem_backend_uart_async_open(void *data)
 		LOG_ERR("Failed to power on UART: %d", ret);
 		return ret;
 	}
-	if (backend->dtr_gpio) {
-		gpio_pin_set_dt(backend->dtr_gpio, 1);
-	}
-
 	atomic_set_bit(&backend->async.common.state,
 		       MODEM_BACKEND_UART_ASYNC_STATE_RX_BUF0_USED_BIT);
 	atomic_set_bit(&backend->async.common.state, MODEM_BACKEND_UART_ASYNC_STATE_RECEIVING_BIT);
@@ -181,7 +177,15 @@ static int modem_backend_uart_async_open(void *data)
 			     CONFIG_MODEM_BACKEND_UART_ASYNC_RECEIVE_IDLE_TIMEOUT_MS * 1000L);
 	if (ret < 0) {
 		atomic_clear(&backend->async.common.state);
+		pm_device_runtime_put(backend->uart);
 		return ret;
+	}
+
+	/* The modem may send buffered data as soon as DTR wakes it. Arm RX
+	 * first: some UART drivers flush their receive FIFO in uart_rx_enable().
+	 */
+	if (backend->dtr_gpio) {
+		gpio_pin_set_dt(backend->dtr_gpio, 1);
 	}
 
 	modem_pipe_notify_opened(&backend->pipe);
@@ -281,11 +285,11 @@ static int modem_backend_uart_async_close(void *data)
 				       MODEM_BACKEND_UART_ASYNC_STATE_OPEN_BIT)) {
 		return 0;
 	}
-	uart_tx_abort(backend->uart);
-	uart_rx_disable(backend->uart);
 	if (backend->dtr_gpio) {
 		gpio_pin_set_dt(backend->dtr_gpio, 0);
 	}
+	uart_tx_abort(backend->uart);
+	uart_rx_disable(backend->uart);
 	ret = pm_device_runtime_put_async(backend->uart, K_NO_WAIT);
 	if (ret < 0) {
 		LOG_ERR("Failed to power off UART: %d", ret);

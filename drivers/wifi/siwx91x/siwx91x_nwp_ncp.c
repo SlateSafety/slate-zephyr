@@ -458,38 +458,37 @@ void sl_si91x_host_enable_high_speed_bus(void)
 
 void sl_si91x_host_set_sleep_indicator(void)
 {
-// #if DT_INST_NODE_HAS_PROP(0, sleep_request_gpios)
-// 	if (ncp_dev_instance != NULL) {
-// 		const struct siwx91x_ncp_config *cfg = ncp_dev_instance->config;
-// 		LOG_INF("SET SLEEP INDICATOR");
-// 		gpio_pin_set_dt(&cfg->sleep_gpio, 1);
-// 	}
-// #endif
+#if DT_INST_NODE_HAS_PROP(0, sleep_request_gpios)
+	if (ncp_dev_instance != NULL) {
+		const struct siwx91x_ncp_config *cfg = ncp_dev_instance->config;
+		LOG_INF("SET SLEEP INDICATOR");
+		gpio_pin_set_dt(&cfg->sleep_gpio, 1);
+	}
+#endif
 }
 
 void sl_si91x_host_clear_sleep_indicator(void)
 {
-// #if DT_INST_NODE_HAS_PROP(0, sleep_request_gpios)
-// 	if (ncp_dev_instance != NULL) {
-// 		const struct siwx91x_ncp_config *cfg = ncp_dev_instance->config;
-// 		LOG_INF("CLEAR SLEEP INDICATOR");
-// 		gpio_pin_set_dt(&cfg->sleep_gpio, 0);
-// 	}
-// 	LOG_DBG("Sleep indicator cleared");
-// #endif
+#if DT_INST_NODE_HAS_PROP(0, sleep_request_gpios)
+	if (ncp_dev_instance != NULL) {
+		const struct siwx91x_ncp_config *cfg = ncp_dev_instance->config;
+		LOG_INF("CLEAR SLEEP INDICATOR");
+		gpio_pin_set_dt(&cfg->sleep_gpio, 0);
+	}
+	LOG_DBG("Sleep indicator cleared");
+#endif
 }
 
 uint32_t sl_si91x_host_get_wake_indicator(void)
 {
-// #if DT_INST_NODE_HAS_PROP(0, wake_indicator_gpios)
-// 	if (ncp_dev_instance != NULL) {
-// 		const struct siwx91x_ncp_config *cfg = ncp_dev_instance->config;
-// 		// LOG_INF("GET WAKE INDICATOR");
-// 		return gpio_pin_get_dt(&cfg->wake_gpio);
-// 	}
-// #endif
-	/* Default: always awake */
-	return 1;
+#if DT_INST_NODE_HAS_PROP(0, wake_indicator_gpios)
+	if (ncp_dev_instance != NULL) {
+		const struct siwx91x_ncp_config *cfg = ncp_dev_instance->config;
+		LOG_INF("GET WAKE INDICATOR");
+		return gpio_pin_get_dt(&cfg->wake_gpio) > 0;
+	}
+#endif
+	return 0;
 }
 
 /* === UART stubs (unused in SPI mode) === */
